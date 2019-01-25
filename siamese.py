@@ -232,6 +232,89 @@ class TVLoss(nn.Module):
 # Networks and Models
 ###############################################################################
 # moved to models.networks
+class SiameseNetwork(nn.Module):
+    def __init__(self, base=None):
+        super(SiameseNetwork, self).__init__()
+        # base
+        self.base = base
+
+
+
+        if cnn_dim:
+            conv_block = []
+            nf_prev = base.feature_dim
+            for i in range(len(cnn_dim) - 1):
+                nf = cnn_dim[i]
+                conv_block += [
+                    nn.Conv2d(nf_prev, nf, kernel_size=3, stride=1, padding=cnn_pad, bias=True),
+                    nn.BatchNorm2d(nf),
+                    nn.LeakyReLU(cnn_relu_slope)
+                ]
+                nf_prev = nf
+            conv_block += [nn.Conv2d(nf_prev, cnn_dim[-1], kernel_size=3, stride=1, padding=cnn_pad, bias=True)]
+            self.cnn = nn.Sequential(*conv_block)
+            feature_dim = cnn_dim[-1]
+        else:
+            self.cnn = None
+            feature_dim = base.feature_dim
+        # connection
+        cxn_blocks = [
+            nn.BatchNorm2d(cnn_dim[-1]),
+            nn.LeakyReLU(cnn_relu_slope)
+        ]
+        self.cxn = None if no_cxn else nn.Sequential(*cxn_blocks)
+        # fc layers
+        fc_blocks = []
+        nf_prev = feature_dim * 2 if self.residual else feature_dim * 3
+        for i in range(len(fc_dim) - 1):
+            nf = fc_dim[i]
+            fc_blocks += [
+                nn.Dropout(dropout),
+                nn.Conv2d(nf_prev, nf, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.LeakyReLU(fc_relu_slope)
+            ]
+            nf_prev = nf
+        if len(fc_dim) > 0:
+            fc_blocks += [
+                nn.Dropout(dropout),
+                nn.Conv2d(nf_prev, fc_dim[-1], kernel_size=1, stride=1, padding=0, bias=True)
+            ]
+        self.fc = nn.Sequential(*fc_blocks) if len(fc_dim) > 0 else None
+        self.feature_dim = feature_dim
+
+    def forward_once(self, x):
+        theta = None
+        if self.stn:
+            x, theta = self.stn(x)
+        output = self.base.forward(x)
+        if self.cnn:
+            output = self.cnn(output)
+        if self.cxn:
+            output = self.cxn(output)
+        if self.pooling == 'avg':
+            output = nn.AvgPool2d(output.size(2))(output)
+        elif self.pooling == 'max':
+            output = nn.MaxPool2d(output.size(2))(output)
+        return output, theta
+
+    def forward(self, input1, input2):
+        feature1, theta1 = self.forward_once(input1)
+        feature2, theta2 = self.forward_once(input2)
+        if self.fc and self.residual:
+            output = torch.cat((feature1, feature2), dim=1)
+            output = self.fc(output) + (feature1-feature2)
+        elif self.fc and not self.residual:
+            output = torch.cat((feature1-feature2, feature1, feature2), dim=1)
+            output = self.fc(output)
+        else:
+            output = feature1-feature2
+
+        return feature1, feature2, output, theta1, theta2
+
+    def load_pretrained(self, state_dict):
+        # used when loading pretrained base model
+        # warning: self.cnn and self.fc won't be initialized
+        self.base.load_pretrained(state_dict)
 
 
 ###############################################################################
@@ -351,6 +434,11 @@ def feature2image(image_tensor):
 ###############################################################################
 # Main Routines
 ###############################################################################
+def my_get_model(opt):
+    base = base_network.VGG()
+
+
+
 def get_model(opt):
     # define base model
     base = None
