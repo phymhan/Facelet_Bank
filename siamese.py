@@ -237,50 +237,9 @@ class SiameseNetwork(nn.Module):
         super(SiameseNetwork, self).__init__()
         # base
         self.base = base
-
-
-
-        if cnn_dim:
-            conv_block = []
-            nf_prev = base.feature_dim
-            for i in range(len(cnn_dim) - 1):
-                nf = cnn_dim[i]
-                conv_block += [
-                    nn.Conv2d(nf_prev, nf, kernel_size=3, stride=1, padding=cnn_pad, bias=True),
-                    nn.BatchNorm2d(nf),
-                    nn.LeakyReLU(cnn_relu_slope)
-                ]
-                nf_prev = nf
-            conv_block += [nn.Conv2d(nf_prev, cnn_dim[-1], kernel_size=3, stride=1, padding=cnn_pad, bias=True)]
-            self.cnn = nn.Sequential(*conv_block)
-            feature_dim = cnn_dim[-1]
-        else:
-            self.cnn = None
-            feature_dim = base.feature_dim
-        # connection
-        cxn_blocks = [
-            nn.BatchNorm2d(cnn_dim[-1]),
-            nn.LeakyReLU(cnn_relu_slope)
-        ]
-        self.cxn = None if no_cxn else nn.Sequential(*cxn_blocks)
-        # fc layers
-        fc_blocks = []
-        nf_prev = feature_dim * 2 if self.residual else feature_dim * 3
-        for i in range(len(fc_dim) - 1):
-            nf = fc_dim[i]
-            fc_blocks += [
-                nn.Dropout(dropout),
-                nn.Conv2d(nf_prev, nf, kernel_size=1, stride=1, padding=0, bias=True),
-                nn.LeakyReLU(fc_relu_slope)
-            ]
-            nf_prev = nf
-        if len(fc_dim) > 0:
-            fc_blocks += [
-                nn.Dropout(dropout),
-                nn.Conv2d(nf_prev, fc_dim[-1], kernel_size=1, stride=1, padding=0, bias=True)
-            ]
-        self.fc = nn.Sequential(*fc_blocks) if len(fc_dim) > 0 else None
-        self.feature_dim = feature_dim
+        self.feature_num = 0
+        self.feature_dim = None
+        self.fc = []
 
     def forward_once(self, x):
         theta = None
@@ -295,11 +254,13 @@ class SiameseNetwork(nn.Module):
             output = nn.AvgPool2d(output.size(2))(output)
         elif self.pooling == 'max':
             output = nn.MaxPool2d(output.size(2))(output)
-        return output, theta
+        return output
 
     def forward(self, input1, input2):
-        feature1, theta1 = self.forward_once(input1)
-        feature2, theta2 = self.forward_once(input2)
+        feature1 = self.forward_once(input1)
+        feature2 = self.forward_once(input2)
+
+
         if self.fc and self.residual:
             output = torch.cat((feature1, feature2), dim=1)
             output = self.fc(output) + (feature1-feature2)
