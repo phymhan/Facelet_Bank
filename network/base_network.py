@@ -65,7 +65,7 @@ class BaseModel(object):
         network.load_state_dict(torch.load(save_path))
 
     # helper loading function that can be used by subclasses
-    def load_network(self,network, pretrain_path, label):
+    def load_network(self, network, pretrain_path, label):
         filename = '%s.pth' % label
         save_path = os.path.join(pretrain_path, filename)
         print('loading %s from %s' % (filename, pretrain_path))
@@ -131,6 +131,12 @@ class VGG(nn.Module, BaseModel):
         features_1 = self.features_1(x)
         features_2 = self.features_2(features_1)
         features_3 = self.features_3(features_2)
+        # print('='*20)
+        # print(features_1.size())
+        # print('=' * 20)
+        # print(features_2.size())
+        # print('=' * 20)
+        # print(features_3.size())
         return features_1, features_2, features_3
 
 

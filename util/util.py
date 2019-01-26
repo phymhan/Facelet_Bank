@@ -230,3 +230,20 @@ def print_args_to_screen(args):
     print('\n')
 
 
+def upsample2d(inputTensor, targetSize):
+    # 2d upsampling of a 4d tensor
+    if targetSize <= 0 or inputTensor.size(2) == targetSize:
+        return inputTensor
+    else:
+        # return torch.nn.Upsample(size=(targetSize, targetSize), mode='bilinear', align_corners=True)(inputTensor)
+        return torch.nn.functional.interpolate(input=inputTensor, size=(targetSize, targetSize), mode='bilinear', align_corners=True)
+
+
+def expand2d(inputTensor, targetSize):
+    # expand a 4d tensor along axis 2 and 3 to targetSize
+    return inputTensor.expand(inputTensor.size(0), inputTensor.size(1), targetSize, targetSize)
+
+
+def expand2d_as(inputTensor, targetTensor):
+    # expand a 4d tensor along axis 0, 2 and 3 to those of targetTensor
+    return inputTensor.expand(targetTensor.size(0), inputTensor.size(1), targetTensor.size(2), targetTensor.size(3))

@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
-from util.util import expand2d
 import numpy as np
 from util.util import upsample2d
 

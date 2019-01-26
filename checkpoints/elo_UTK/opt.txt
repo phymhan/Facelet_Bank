@@ -1,0 +1,52 @@
+--------------- Options -----------------
+            affineDegrees: 5                             
+              affineScale: [0.95, 1.05]                  
+               batch_size: 20                            	[default: 100]
+           checkpoint_dir: checkpoints                   
+                  cnn_dim: [64, 1]                       
+                  cnn_pad: 1                             
+           cnn_relu_slope: 0.7                           
+           continue_train: False                         
+                 datafile: ../ws-gan/sourcefiles/UTK_pairs_train.txt	[default: ]
+             datafile_val: ../ws-gan/sourcefiles/UTK_pairs_val.txt	[default: ]
+                 dataroot: datasets/UTK                  	[default: datasets/UTKFace]
+             dataroot_val: datasets/UTK                  	[default: ]
+               display_id: 1                             
+             display_port: 8097                          
+         draw_prob_thresh: 0.16                          
+                  dropout: 0.05                          
+              epoch_count: 1                             
+                   fc_dim: []                            
+            fc_relu_slope: 0.3                           
+              fc_residual: False                         
+                 fineSize: 224                           
+         finetune_fc_only: False                         
+                  gpu_ids: 0                             
+                init_type: kaiming                       
+                  isTrain: True                          	[default: None]
+       lambda_contrastive: 0.0                           
+    lambda_regularization: 0.0                           
+                 loadSize: 224                           	[default: 240]
+                       lr: 0.0002                        
+                     mode: train                         
+                 n_layers: 3                             
+                     name: elo_UTK                       	[default: exp]
+                       nf: 64                            
+                   no_cxn: False                         
+                  no_flip: False                         
+               num_epochs: 20                            	[default: 50]
+              num_workers: 4                             
+                  pooling: avg                           
+    pretrained_model_path: pretrained_models/resnet18-5c106cde.pth
+ pretrained_model_path_IP: pretrained_models/alexnet-owt-4df8aa71.pth
+               print_freq: 10                            
+          save_epoch_freq: 1                             	[default: 5]
+         save_latest_freq: 100                           
+           serial_batches: False                         
+               transforms: resize_and_crop               	[default: resize_affine_crop]
+         use_color_jitter: False                         
+                  use_gpu: True                          	[default: None]
+                   weight: []                            
+              which_epoch: latest                        
+              which_model: resnet18                      
+----------------- End -------------------

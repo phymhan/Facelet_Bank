@@ -19,6 +19,7 @@ import torchvision
 import torchvision.transforms as transforms
 import torchvision.utils
 from network import base_network
+from network import networks
 from tqdm import tqdm
 import time
 
@@ -76,10 +77,6 @@ class Options():
         parser.add_argument('--save_latest_freq', type=int, default=100, help='frequency of saving the latest results')
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
         parser.add_argument('--draw_prob_thresh', type=float, default=0.16)
-        parser.add_argument('--which_model_stn', type=str, default='None')
-        parser.add_argument('--fineSize_ST', type=int, default=128, help='fineSize for STN')
-        parser.add_argument('--theta_loss', type=str, default='mse')
-        parser.add_argument('--lambda_theta', type=float, default=0.0, help='regularization on theta in STN')
 
         return parser
 
@@ -237,45 +234,40 @@ class SiameseNetwork(nn.Module):
         super(SiameseNetwork, self).__init__()
         # base
         self.base = base
-        self.feature_num = 0
-        self.feature_dim = None
-        self.fc = []
+
+        fc_blocks = [
+            nn.Conv2d(256, 1, kernel_size=56, stride=1, padding=0, bias=False)
+        ]
+        self.fc1 = nn.Sequential(*fc_blocks)
+        fc_blocks = [
+            nn.Conv2d(512, 1, kernel_size=28, stride=1, padding=0, bias=False)
+        ]
+        self.fc2 = nn.Sequential(*fc_blocks)
+        fc_blocks = [
+            nn.Conv2d(512, 1, kernel_size=14, stride=1, padding=0, bias=False)
+        ]
+        self.fc3 = nn.Sequential(*fc_blocks)
 
     def forward_once(self, x):
-        theta = None
-        if self.stn:
-            x, theta = self.stn(x)
-        output = self.base.forward(x)
-        if self.cnn:
-            output = self.cnn(output)
-        if self.cxn:
-            output = self.cxn(output)
-        if self.pooling == 'avg':
-            output = nn.AvgPool2d(output.size(2))(output)
-        elif self.pooling == 'max':
-            output = nn.MaxPool2d(output.size(2))(output)
+        outputs = self.base.forward(x)
+        return outputs
+
+    def get_inner_prod(self, x):
+        feature = self.base.forward(x)
+        output = self.fc1.forward(feature[0]) + \
+                 self.fc2.forward(feature[1]) + \
+                 self.fc3.forward(feature[2])
         return output
 
     def forward(self, input1, input2):
         feature1 = self.forward_once(input1)
         feature2 = self.forward_once(input2)
 
+        output = self.fc1.forward(feature1[0]-feature2[0]) + \
+                 self.fc2.forward(feature1[1]-feature2[1]) + \
+                 self.fc3.forward(feature1[2]-feature2[2])
 
-        if self.fc and self.residual:
-            output = torch.cat((feature1, feature2), dim=1)
-            output = self.fc(output) + (feature1-feature2)
-        elif self.fc and not self.residual:
-            output = torch.cat((feature1-feature2, feature1, feature2), dim=1)
-            output = self.fc(output)
-        else:
-            output = feature1-feature2
-
-        return feature1, feature2, output, theta1, theta2
-
-    def load_pretrained(self, state_dict):
-        # used when loading pretrained base model
-        # warning: self.cnn and self.fc won't be initialized
-        self.base.load_pretrained(state_dict)
+        return feature1, feature2, output
 
 
 ###############################################################################
@@ -395,59 +387,21 @@ def feature2image(image_tensor):
 ###############################################################################
 # Main Routines
 ###############################################################################
-def my_get_model(opt):
-    base = base_network.VGG()
-
-
-
 def get_model(opt):
-    # define base model
-    base = None
-    if opt.which_model == 'alexnet':
-        base = networks.AlexNetFeature(input_nc=3, pooling='')
-    elif 'resnet' in opt.which_model:
-        base = networks.ResNetFeature(input_nc=3, which_model=opt.which_model)
-    else:
-        raise NotImplementedError('Model [%s] is not implemented.' % opt.which_model)
-
-    # define Siamese Network
-    # FIXME: SiameseNetwork or SiameseFeature according to opt.mode
-    if opt.mode == 'train' or opt.mode == 'attention':
-        stn = networks.define_STN(input_nc=3, which_model_stn=opt.which_model_stn, size_in=opt.fineSize_ST,
-                                  size_out=opt.fineSize, output_theta=True, init_type=opt.init_type,
-                                  gpu_ids=opt.gpu_ids)
-        net = networks.SiameseNetwork(base, pooling=opt.pooling, cnn_dim=opt.cnn_dim, cnn_pad=opt.cnn_pad,
-                                      cnn_relu_slope=opt.cnn_relu_slope, fc_dim=opt.fc_dim,
-                                      fc_relu_slope=opt.fc_relu_slope, fc_residual=opt.fc_residual,
-                                      dropout=opt.dropout, no_cxn=opt.no_cxn, stn=stn)
-    else:  # 'embedding' or 'optimize'
-        stn = networks.define_STN(input_nc=3, which_model_stn=opt.which_model_stn, size_in=opt.fineSize_ST,
-                                  size_out=opt.fineSize, output_theta=False, init_type=opt.init_type,
-                                  gpu_ids=opt.gpu_ids)
-        net = networks.SiameseFeature(base, pooling=opt.pooling, cnn_dim=opt.cnn_dim, cnn_pad=opt.cnn_pad,
-                                      cnn_relu_slope=opt.cnn_relu_slope, stn=stn)
-
-    # initialize | load weights
+    base = base_network.VGG(pretrained=True)
+    net = SiameseNetwork(base=base)
     if opt.mode == 'train' and not opt.continue_train:
-        net.apply(weights_init)
-        if opt.pretrained_model_path:
-            if isinstance(net, torch.nn.DataParallel):
-                net.module.load_pretrained(opt.pretrained_model_path)
-            else:
-                net.load_pretrained(opt.pretrained_model_path)
-        if stn is not None:
-            if isinstance(net, torch.nn.DataParallel):
-                net.module.stn.init_identity()
-            else:
-                net.stn.init_identity()
+        net.fc1.apply(weights_init)
+        net.fc2.apply(weights_init)
+        net.fc3.apply(weights_init)
     else:
         # HACK: strict=False
-        net.load_state_dict(torch.load(os.path.join(opt.checkpoint_dir, opt.name, '{}_net.pth'.format(opt.which_epoch))), strict=False)
-    
+        net.load_state_dict(torch.load(os.path.join(opt.checkpoint_dir, opt.name, '{}_net.pth'.format(opt.which_epoch))), strict=True)
+
     if opt.mode != 'train':
         set_requires_grad(net, False)
         net.eval()
-    
+
     if opt.use_gpu:
         net.cuda()
     return net
@@ -497,8 +451,6 @@ def get_transform(opt):
 
 # Routines for training
 def train(opt, net, dataloader, dataloader_val=None):
-    if opt.which_model_stn.lower() == 'none':
-        opt.lambda_theta = 0
     if opt.lambda_contrastive > 0:
         criterion_constrastive = networks.ContrastiveLoss()
     opt.save_dir = os.path.join(opt.checkpoint_dir, opt.name)
@@ -507,17 +459,9 @@ def train(opt, net, dataloader, dataloader_val=None):
     
     # criterion
     criterion = networks.BinaryCrossEntropyLoss()
-    criterion_theta = networks.AffineIdentityLoss(opt.theta_loss, torch.cuda.FloatTensor if opt.use_gpu else torch.FloatTensor)
 
     # optimizer
-    if opt.finetune_fc_only:
-        if isinstance(net, nn.DataParallel):
-            param = net.module.get_finetune_parameters()
-        else:
-            param = net.get_finetune_parameters()
-    else:
-        param = net.parameters()
-    optimizer = optim.Adam(param, lr=opt.lr)
+    optimizer = optim.Adam(net.parameters(), lr=opt.lr)
 
     dataset_size, dataset_size_val = opt.dataset_size, opt.dataset_size_val
     loss_history = []
@@ -525,8 +469,6 @@ def train(opt, net, dataloader, dataloader_val=None):
     num_iter_per_epoch = math.ceil(dataset_size / opt.batch_size)
     opt.display_val_acc = not not dataloader_val
     loss_legend = ['classification']
-    if opt.lambda_theta > 0:
-        loss_legend.append('theta')
     if opt.lambda_contrastive > 0:
         loss_legend.append('contrastive')
     if opt.lambda_regularization > 0:
@@ -534,14 +476,13 @@ def train(opt, net, dataloader, dataloader_val=None):
     if opt.display_id >= 0:
         import visdom
         vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
-        # plot_data = {'X': [], 'Y': [], 'leg': ['loss']}
         plot_loss = {'X': [], 'Y': [], 'leg': loss_legend}
         plot_acc = {'X': [], 'Y': [], 'leg': ['train', 'val'] if opt.display_val_acc else ['train']}
 
     torch.save(net.cpu().state_dict(), os.path.join(opt.save_dir, 'init_net.pth'))
     if opt.use_gpu:
         net.cuda()
-    
+
     # start training
     for epoch in range(opt.epoch_count, opt.num_epochs+opt.epoch_count):
         epoch_iter = 0
@@ -558,18 +499,12 @@ def train(opt, net, dataloader, dataloader_val=None):
             optimizer.zero_grad()
 
             # net forward
-            feat1, feat2, score, th1, th2 = net(img0, img1)
+            feat1, feat2, score = net(img0, img1)
 
             losses = {}
             # classification loss
             loss = criterion(score, label)
             losses['classification'] = loss.item()
-
-            # regularization on theta
-            if opt.lambda_theta > 0:
-                this_loss = (criterion_theta(th1)+criterion_theta(th2))/2 * opt.lambda_theta
-                loss += this_loss
-                losses['theta'] = this_loss.item()
 
             # contrastive loss
             if opt.lambda_contrastive > 0:
@@ -591,8 +526,6 @@ def train(opt, net, dataloader, dataloader_val=None):
                 this_loss = (reg1 + reg2) * opt.lambda_regularization
                 loss += this_loss
                 losses['regularization'] = this_loss.item()
-            
-            # loss = loss_classification + loss_contrastive + loss_regularization
 
             # get predictions
             pred_train.append(get_prediction(score, opt.draw_prob_thresh))
@@ -612,15 +545,6 @@ def train(opt, net, dataloader, dataloader_val=None):
                         opts={'title': 'loss', 'legend': plot_loss['leg'], 'xlabel': 'epoch', 'ylabel': 'loss'},
                         win=opt.display_id
                     )
-
-                    if opt.which_model_stn.lower() != 'none':
-                        image_tensor = img0[0:1, ...]
-                        image = image_tensor[0].cpu().numpy().transpose((1, 2, 0))
-                        image = (image * np.array([0.2023, 0.1994, 0.2010]) + np.array([0.4914, 0.4822, 0.4465])) * 255
-                        image_tensor_transformed, _ = net.stn(image_tensor)
-                        image_transformed = image_tensor_transformed.detach()[0].cpu().numpy().transpose((1, 2, 0))
-                        image_transformed = (image_transformed * np.array([0.2023, 0.1994, 0.2010]) + np.array([0.4914, 0.4822, 0.4465])) * 255
-                        vis.images([image.transpose((2, 0, 1)), image_transformed.transpose((2, 0, 1))], win=opt.display_id + 10)
 
                 loss_history.append(loss.item())
             
@@ -646,7 +570,7 @@ def train(opt, net, dataloader, dataloader_val=None):
                 img0, img1, label = data
                 if opt.use_gpu:
                     img0, img1 = img0.cuda(), img1.cuda()
-                _, _, output, _, _ = net.forward(img0, img1)
+                _, _, output = net.forward(img0, img1)
                 pred_val.append(get_prediction(output, opt.draw_prob_thresh))
                 target_val.append(label.cpu().numpy())
             err_val = np.count_nonzero(np.concatenate(pred_val) - np.concatenate(target_val)) / dataset_size_val
@@ -687,7 +611,7 @@ def test(opt, net, dataloader):
         img0, img1, label = data
         if opt.use_gpu:
             img0, img1 = img0.cuda(), img1.cuda()
-        _, _, output, _, _ = net.forward(img0, img1)
+        _, _, output = net.forward(img0, img1)
 
         pred_val.append(get_prediction(output, opt.draw_prob_thresh).squeeze())
         target_val.append(label.cpu().numpy().squeeze())
@@ -698,6 +622,133 @@ def test(opt, net, dataloader):
     print('accuracy: %.6f' % (100. * (1-err)))
 
 
+def F_inverse(opt, net, dataloader):
+    import visdom
+    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
+
+    # netIP = networks.AlexNetFeature(input_nc=3, pooling='None')
+    # netIP.cuda()
+    # if isinstance(netIP, torch.nn.DataParallel):
+    #     netIP.module.load_pretrained(opt.pretrained_model_path_IP)
+    # else:
+    #     netIP.load_pretrained(opt.pretrained_model_path_IP)
+
+    delta = 20
+
+    W1 = net.fc1[0].weight.data.clone()
+    W2 = net.fc2[0].weight.data.clone()
+    W3 = net.fc3[0].weight.data.clone()
+
+    for i, data in enumerate(dataloader, 0):
+        img0, path0 = data
+        if opt.use_gpu:
+            img0 = img0.cuda()
+        emb0 = net.forward_once(img0)
+        emb1 = [emb0[0]+W1*delta, emb0[1]+W2*delta, emb0[2]+W3*delta]
+
+        img1 = optimize_image(img0, emb1, net, None, opt)
+        print(img0.size())
+        print(img1.size())
+
+        images = []
+        images += [tensor2image(img0.detach())]
+        images += [tensor2image(img1.detach())]
+        vis.images(images, win=opt.display_id + 10)
+
+        # hack
+        save_image(images[0], 'results/image_%d_A.png' % i)
+        save_image(images[1], 'results/image_%d_B.png' % i)
+
+
+def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
+    tv_lambda = 0.1
+
+    x = initial_image.clone()
+
+    recon_var = nn.Parameter(x, requires_grad=True)
+
+    # Get size of features
+    # orig_feature_vars = net.forward_once(recon_var)
+    # sizes = ([f.data[:1].size() for f in orig_feature_vars])
+    # cat_offsets = torch.cat(
+    #     [torch.Tensor([0]), torch.cumsum(torch.Tensor([f.data[:1].nelement() for f in orig_feature_vars]), 0)])
+
+    # Reshape provided features to match original features
+    # cat_features = F.view(-1)
+    # features = tuple(Variable(cat_features[int(start_i):int(end_i)].view(size)).cuda()
+    #                  for size, start_i, end_i in zip(sizes, cat_offsets[:-1], cat_offsets[1:]))
+    features = F
+
+    # Create optimizer and loss functions
+    optimizer = optim.LBFGS(
+        params=[recon_var],
+        max_iter=n_iter,
+    )
+    optimizer.n_steps = 0
+    criterion3 = nn.MSELoss(size_average=False).cuda()
+    criterion4 = nn.MSELoss(size_average=False).cuda()
+    criterion5 = nn.MSELoss(size_average=False).cuda()
+    criterion_tv = TVLoss().cuda()
+
+    # Optimize
+    def step():
+        net.zero_grad()
+        if recon_var.grad is not None:
+            recon_var.grad.data.fill_(0)
+        # OR #
+        # optimizer.zero_grad()
+
+        output_var = net.forward_once(recon_var)
+        loss3 = criterion3(output_var[0], features[0])
+        loss4 = criterion4(output_var[1], features[1])
+        loss5 = criterion5(output_var[2], features[2])
+        loss_tv = tv_lambda * criterion_tv(recon_var)
+        loss = loss3 + loss4 + loss5 + loss_tv
+        loss.backward()
+
+        if optimizer.n_steps % 25 == 0:
+            print('Step: %d  total: %.1f  conv3: %.1f  conv4: %.1f  conv5: %.1f  tv: %.3f' %
+                  (optimizer.n_steps, loss.item(), loss3.item(), loss4.item(), loss5.item(), loss_tv.item()))
+
+        optimizer.n_steps += 1
+        return loss
+
+    optimizer.step(step)
+    recon = recon_var.cpu()
+
+    return recon
+
+
+
+
+
+    # img_orig = img
+    # img = img_orig.clone()
+    # img.requires_grad = True
+    # optim_input = optim.LBFGS([img], lr=lr)
+    # emb = emb.view(1, 1, 1, 1)
+    # # tv_loss = TVLoss()
+    #
+    # def closure():
+    #     optim_input.zero_grad()
+    #     img_emb = net.forward(img)
+    #
+    #     loss = 0.5 * torch.nn.MSELoss()(img_emb, emb) + total_variation_loss(img) * 0.1
+    #     loss.backward()
+    #     return loss
+    #
+    # for _ in tqdm(range(100)):
+    #     optim_input.step(closure)
+    #
+    # return img
+
+
+
+
+
+
+
+
 # Routines for extracting embedding
 def embedding(opt, net, dataloader):
     features = []
@@ -706,9 +757,9 @@ def embedding(opt, net, dataloader):
         img0, path0 = data
         if opt.use_gpu:
             img0 = img0.cuda()
-        feature = net.forward(img0)
+        feature = net.get_inner_prod(img0)
         feature = feature.cpu().detach().numpy()
-        features.append(feature.reshape([1, net.feature_dim]))
+        features.append(feature.reshape([1, 1]))
         labels.append(get_attr_value(path0[0]))
         print('--> %s' % path0[0])
 
@@ -719,79 +770,6 @@ def embedding(opt, net, dataloader):
 
 
 # Routines for visualization
-def optimize(opt, net, dataloader):
-    import visdom
-    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
-
-    netIP = networks.AlexNetFeature(input_nc=3, pooling='None')
-    netIP.cuda()
-    if isinstance(netIP, torch.nn.DataParallel):
-        netIP.module.load_pretrained(opt.pretrained_model_path_IP)
-    else:
-        netIP.load_pretrained(opt.pretrained_model_path_IP)
-
-    for i, data in enumerate(dataloader, 0):
-        img0, emb1 = data
-        if opt.use_gpu:
-            img0, emb1 = img0.cuda(), emb1.cuda()
-        img1 = optimize_image(img0, emb1, net, netIP, opt)
-
-        images = []
-        images += [tensor2image(img0.detach())]
-        images += [tensor2image(img1.detach())]
-        vis.images(images, win=opt.display_id + 10)
-
-        # hack
-        save_image(images[0], 'samples_vis/optimize/iter%d_o.png' % i)
-        save_image(images[1], 'samples_vis/optimize/iter%d_t.png' % i)
-
-
-def optimize_image(img, emb, netE, netIP, opt, n_iter=100, lr=0.1):
-    img_orig = img
-    img = img_orig.clone()
-    img.requires_grad = True
-    optim_input = optim.LBFGS([img], lr=lr)
-    emb = emb.view(1, 1, 1, 1)
-    # tv_loss = TVLoss()
-
-    def closure():
-        optim_input.zero_grad()
-        img_emb = netE.forward(img)
-
-        loss = 0.5 * torch.nn.MSELoss()(img_emb, emb) + total_variation_loss(img) * 0.1
-        loss.backward()
-        return loss
-
-    for _ in tqdm(range(100)):
-        optim_input.step(closure)
-
-    return img
-
-
-# def optimize_image(img, emb, netE, netIP, opt, n_iter=100, lr=0.1):
-#     img_orig = img
-#     img = img_orig.clone()
-#     img.zero_()
-#     img.requires_grad = True
-#     optim_input = optim.LBFGS([img], lr=lr)
-#     emb = emb.view(1, 1, 1, 1)
-#
-#     def closure():
-#         optim_input.zero_grad()
-#         img_emb = netE.forward(img)
-#
-#         feature_orig = netIP(img_orig).detach()
-#         feature_orig.requires_grad = False
-#         loss_IP = torch.nn.MSELoss()(netIP(img), feature_orig) * 1
-#         loss = 0.5 * torch.nn.MSELoss()(img_emb, emb) + 0.001 * total_variation_loss(img) + 0.1 * loss_IP
-#         loss.backward()
-#         return loss
-#
-#     for _ in tqdm(range(n_iter)):
-#         optim_input.step(closure)
-#
-#     return img
-
 def save_image(npy, path):
     scipy.misc.imsave(path, npy.transpose((1,2,0)))
 
@@ -921,12 +899,11 @@ if __name__=='__main__':
         dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
         # get embedding
         embedding(opt, net, dataloader)
-    elif opt.mode == 'optimize':
+    elif opt.mode == 'inverse':
         # get dataloader
-        dataset = ImageEmbeddingDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
+        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
         dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        # get embedding
-        optimize(opt, net, dataloader)
+        F_inverse(opt, net, dataloader)
     elif opt.mode == 'attention':
         # get dataloader
         dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
