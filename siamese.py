@@ -22,6 +22,8 @@ from network import base_network
 from network import networks
 from tqdm import tqdm
 import time
+from util.util import upsample2d
+import itertools
 
 
 ###############################################################################
@@ -235,39 +237,54 @@ class SiameseNetwork(nn.Module):
         # base
         self.base = base
 
-        fc_blocks = [
-            nn.Conv2d(256, 1, kernel_size=56, stride=1, padding=0, bias=False)
-        ]
-        self.fc1 = nn.Sequential(*fc_blocks)
-        fc_blocks = [
-            nn.Conv2d(512, 1, kernel_size=28, stride=1, padding=0, bias=False)
-        ]
-        self.fc2 = nn.Sequential(*fc_blocks)
-        fc_blocks = [
-            nn.Conv2d(512, 1, kernel_size=14, stride=1, padding=0, bias=False)
-        ]
-        self.fc3 = nn.Sequential(*fc_blocks)
+        self.fc1 = nn.Conv2d(256, 1, kernel_size=56, stride=1, padding=0, bias=False)
+        self.fc2 = nn.Conv2d(512, 1, kernel_size=28, stride=1, padding=0, bias=False)
+        self.fc3 = nn.Conv2d(512, 1, kernel_size=14, stride=1, padding=0, bias=False)
+        self.fc_linear = nn.Conv2d(3, 1, kernel_size=1, stride=1, padding=0, bias=False)
 
     def forward_once(self, x):
         outputs = self.base.forward(x)
         return outputs
 
-    def get_inner_prod(self, x):
-        feature = self.base.forward(x)
-        output = self.fc1.forward(feature[0]) + \
-                 self.fc2.forward(feature[1]) + \
-                 self.fc3.forward(feature[2])
-        return output
-
     def forward(self, input1, input2):
         feature1 = self.forward_once(input1)
         feature2 = self.forward_once(input2)
 
-        output = self.fc1.forward(feature1[0]-feature2[0]) + \
-                 self.fc2.forward(feature1[1]-feature2[1]) + \
-                 self.fc3.forward(feature1[2]-feature2[2])
+        output = torch.cat([self.fc1.forward(feature1[0]-feature2[0]),
+                            self.fc2.forward(feature1[1]-feature2[1]),
+                            self.fc3.forward(feature1[2]-feature2[2])], 1)
+        output = self.fc_linear.forward(output)
 
         return feature1, feature2, output
+
+    def get_inner_prod(self, x):
+        feature = self.base.forward(x)
+        output = torch.cat([self.fc1.forward(feature[0]),
+                            self.fc2.forward(feature[1]),
+                            self.fc3.forward(feature[2])], 1)
+        output = self.fc_linear.forward(output)
+        return output
+
+    def get_norm(self, p=2):
+        output = torch.sum(self.fc1.weight.data.pow(2) * self.fc_linear.weight.data[0].pow(2)) + \
+                 torch.sum(self.fc2.weight.data.pow(2) * self.fc_linear.weight.data[1].pow(2)) + \
+                 torch.sum(self.fc3.weight.data.pow(2) * self.fc_linear.weight.data[2].pow(2))
+        output = math.sqrt(output.cpu().item())
+        return output
+
+    def get_heat_map(self, x):
+        feature = self.base.forward(x)
+        feature_ = torch.cat([feature[0]*1, upsample2d(feature[1], 56)*0, upsample2d(feature[2], 56)*0], 1)
+        heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
+        return heat_map
+
+    def get_heat_map_fc(self, x):
+        feature = [(self.fc1.weight.data * self.fc_linear.weight.data[0]).clone(),
+                   (self.fc2.weight.data * self.fc_linear.weight.data[1]).clone(),
+                   (self.fc3.weight.data * self.fc_linear.weight.data[2]).clone()]
+        feature_ = torch.cat([feature[0]*1, upsample2d(feature[1], 56)*1, upsample2d(feature[2], 56)*1], 1)
+        heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
+        return heat_map
 
 
 ###############################################################################
@@ -394,6 +411,7 @@ def get_model(opt):
         net.fc1.apply(weights_init)
         net.fc2.apply(weights_init)
         net.fc3.apply(weights_init)
+        net.fc_linear.weight.data.fill_(1.0)
     else:
         # HACK: strict=False
         net.load_state_dict(torch.load(os.path.join(opt.checkpoint_dir, opt.name, '{}_net.pth'.format(opt.which_epoch))), strict=True)
@@ -461,7 +479,11 @@ def train(opt, net, dataloader, dataloader_val=None):
     criterion = networks.BinaryCrossEntropyLoss()
 
     # optimizer
-    optimizer = optim.Adam(net.parameters(), lr=opt.lr)
+    if opt.finetune_fc_only:
+        optimizer = optim.Adam(itertools.chain(net.fc1.parameters(), net.fc2.parameters(), net.fc3.parameters(),
+                                               net.fc_linear.parameters()), lr=opt.lr)
+    else:
+        optimizer = optim.Adam(net.parameters(), lr=opt.lr)
 
     dataset_size, dataset_size_val = opt.dataset_size, opt.dataset_size_val
     loss_history = []
@@ -622,6 +644,27 @@ def test(opt, net, dataloader):
     print('accuracy: %.6f' % (100. * (1-err)))
 
 
+
+def heatmap(opt, net, dataloader):
+    import visdom
+    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
+
+    for i, data in enumerate(dataloader, 0):
+        img0, path0 = data
+        if opt.use_gpu:
+            img0 = img0.cuda()
+        hm = net.get_heat_map_fc(img0)
+        hm = (hm-hm.min())/(hm.max()-hm.min())*255
+        hm = torch.nn.functional.interpolate(input=hm, size=(224, 224), mode='bilinear', align_corners=True)
+        hm = hm.detach().cpu().numpy()
+        hm = np.tile(hm[0, 0, ...].reshape((224, 224, 1)), (1, 1, 3))
+
+        images = []
+        images += [tensor2image(img0.detach())]
+        images += [hm.transpose((2, 0, 1))]
+        vis.images(images, win=opt.display_id + 10)
+
+
 def F_inverse(opt, net, dataloader):
     import visdom
     vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
@@ -633,11 +676,11 @@ def F_inverse(opt, net, dataloader):
     # else:
     #     netIP.load_pretrained(opt.pretrained_model_path_IP)
 
-    delta = 20
+    delta = -0.6
 
-    W1 = net.fc1[0].weight.data.clone()
-    W2 = net.fc2[0].weight.data.clone()
-    W3 = net.fc3[0].weight.data.clone()
+    W1 = (net.fc1.weight.data * net.fc_linear.weight.data[0]).clone()
+    W2 = (net.fc2.weight.data * net.fc_linear.weight.data[1]).clone()
+    W3 = (net.fc3.weight.data * net.fc_linear.weight.data[2]).clone()
 
     for i, data in enumerate(dataloader, 0):
         img0, path0 = data
@@ -645,10 +688,13 @@ def F_inverse(opt, net, dataloader):
             img0 = img0.cuda()
         emb0 = net.forward_once(img0)
         emb1 = [emb0[0]+W1*delta, emb0[1]+W2*delta, emb0[2]+W3*delta]
+        print(net.get_norm())
 
         img1 = optimize_image(img0, emb1, net, None, opt)
         print(img0.size())
         print(img1.size())
+        print(net.get_inner_prod(img0))
+        print(net.get_inner_prod(img1))
 
         images = []
         images += [tensor2image(img0.detach())]
@@ -664,6 +710,7 @@ def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
     tv_lambda = 0.1
 
     x = initial_image.clone()
+    # x.zero_()
 
     recon_var = nn.Parameter(x, requires_grad=True)
 
@@ -714,9 +761,9 @@ def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
         return loss
 
     optimizer.step(step)
-    recon = recon_var.cpu()
+    recon = recon_var
 
-    return recon
+    return recon # + initial_image
 
 
 
@@ -817,7 +864,7 @@ def get_attention(img0, img1, label, net, opt):
     """
     img0.requires_grad = True
     img1.requires_grad = True
-    feat1, feat2, score, _, _ = net(img0, img1)
+    feat1, feat2, score = net(img0, img1)
     net.zero_grad()
     # prob = torch.nn.functional.sigmoid(score)
     grad_tensor = torch.FloatTensor([1]).view(1, 1, 1, 1).cuda()
@@ -904,6 +951,11 @@ if __name__=='__main__':
         dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
         dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
         F_inverse(opt, net, dataloader)
+    elif opt.mode == 'heatmap':
+        # get dataloader
+        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
+        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
+        heatmap(opt, net, dataloader)
     elif opt.mode == 'attention':
         # get dataloader
         dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
