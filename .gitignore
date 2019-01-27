@@ -7,3 +7,9 @@
 !examples/input.mp4
 !/images/*
 !.gitignore
+checkpoints/
+datasets/
+images/
+results/
+run*.sh
+*/*.dat
