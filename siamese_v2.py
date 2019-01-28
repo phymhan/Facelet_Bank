@@ -47,7 +47,7 @@ class Options():
         parser.add_argument('--init_type', type=str, default='kaiming', help='network initialization [normal|xavier|kaiming|orthogonal]')
         parser.add_argument('--num_epochs', type=int, default=50, help='number of epochs')
         parser.add_argument('--batch_size', type=int, default=100, help='batch size')
-        parser.add_argument('--lr', type=float, default=0.0002, help='learning rate')
+        parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
         parser.add_argument('--which_epoch', type=str, default='latest', help='which epoch to load')
         parser.add_argument('--which_model', type=str, default='resnet18', help='which model')
         parser.add_argument('--n_layers', type=int, default=3, help='only used if which_model==n_layers')
@@ -268,10 +268,22 @@ class SiameseNetwork(nn.Module):
         feature1 = self.forward_once(input1)
         feature2 = self.forward_once(input2)
 
-        delta1 = self.facelet.forward(feature1)
+        delta1 = self.get_delta(feature1)
         output = self.inner_prod(self.minus(feature1, feature2), delta1)
 
         return feature1, feature2, output
+
+    def get_delta(self, feat):
+        delta = self.facelet.forward(feat)
+        # group normalize
+        delta = [f/torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt().view(f.size(0), 1, 1, 1) for f in delta]
+        # concat normalize
+        norm = torch.sum(delta[0].pow(2).view(delta[0].size(0), -1), dim=1) + \
+               torch.sum(delta[1].pow(2).view(delta[1].size(0), -1), dim=1) + \
+               torch.sum(delta[2].pow(2).view(delta[2].size(0), -1), dim=1)
+        norm = norm.sqrt().view(norm.size(0), 1, 1, 1)
+        delta = delta/norm
+        return delta
 
     def minus(self, feat1, feat2):
         return [f1 - f2 for f1, f2 in zip(feat1, feat2)]
@@ -282,6 +294,26 @@ class SiameseNetwork(nn.Module):
         for f1, f2 in zip(feat1, feat2):
             a += torch.sum(f1.view(n, -1) * f2.view(n, -1), dim=1)
         return a.view(n, 1, 1, 1)
+
+    def normalize(self, feat):
+
+        return []
+
+    def get_heat_map(self, x):
+        feat = self.base.forward(x)
+        # feature_ = torch.cat([feature[0]*0, upsample2d(feature[1], 56)*1, upsample2d(feature[2], 56)*0], 1)
+
+        feature_ = feat[1]
+        heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
+        return heat_map
+
+    def get_heat_map_fc(self, x):
+        feat = self.base.forward(x)
+        delta = self.get_delta(feat)
+        feature_ = torch.cat([delta[0]*1, upsample2d(delta[1], 56)*1, upsample2d(delta[2], 56)*1], 1)
+        # feature_ = delta[1]
+        heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
+        return heat_map
 
 
 ###############################################################################
@@ -408,6 +440,7 @@ def get_model(opt):
     net = SiameseNetwork(base=base, facelet=facelet)
     if opt.mode == 'train' and not opt.continue_train:
         print('>> weight not initialized')
+        net.facelet.apply(weights_init)
     else:
         # HACK: strict=False
         net.load_state_dict(torch.load(os.path.join(opt.checkpoint_dir, opt.name, '{}_net.pth'.format(opt.which_epoch))), strict=True)
@@ -698,25 +731,17 @@ def F_inverse(opt, net, dataloader):
     # else:
     #     netIP.load_pretrained(opt.pretrained_model_path_IP)
 
-    delta = -30
-
-    W1 = (net.fc1.weight.data * net.fc_linear.weight.data[0, 0, 0, 0]).clone()
-    W2 = (net.fc2.weight.data * net.fc_linear.weight.data[0, 1, 0, 0]).clone()
-    W3 = (net.fc3.weight.data * net.fc_linear.weight.data[0, 2, 0, 0]).clone()
+    delta = -1
 
     for i, data in enumerate(dataloader, 0):
         img0, path0 = data
         if opt.use_gpu:
             img0 = img0.cuda()
         emb0 = net.forward_once(img0)
+        W1, W2, W3 = net.get_delta(emb0)
         emb1 = [emb0[0]+W1*delta, emb0[1]+W2*delta, emb0[2]+W3*delta]
-        print(net.get_norm())
 
         img1 = optimize_image(img0, emb1, net, None, opt)
-        print(img0.size())
-        print(img1.size())
-        print(net.get_inner_prod(img0))
-        print(net.get_inner_prod(img1))
 
         images = []
         images += [tensor2image(img0.detach())]
@@ -729,7 +754,7 @@ def F_inverse(opt, net, dataloader):
 
 
 def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
-    tv_lambda = 1
+    tv_lambda = 10
 
     x = initial_image.clone()
     # x.zero_()
