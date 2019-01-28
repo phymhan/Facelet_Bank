@@ -292,6 +292,8 @@ def detect_landmarks(ipath,detector,predictor,upsample=0,image=None,resize=None)
 
 def detect_landmarks_from_image(image, detector, predictor):
     dets = detector(image)
+    if len(dets) == 0:
+        return None
     shape = predictor(image, dets[0])
     X = numpy.array([[shape.part(i).y, shape.part(i).x] for i in range(68)]).astype(numpy.float64)
     return X

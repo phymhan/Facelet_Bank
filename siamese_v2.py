@@ -18,12 +18,14 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision
 import torchvision.transforms as transforms
 import torchvision.utils
-from network import base_network
+from network import base_network, facelet_net
 from network import networks
 from tqdm import tqdm
 import time
 from util.util import upsample2d
 import itertools
+import cv2
+from util import alignface
 
 
 ###############################################################################
@@ -118,18 +120,39 @@ class Options():
 # Dataset and Dataloader
 ###############################################################################
 class SiameseNetworkDataset(Dataset):
-    def __init__(self, rootdir, source_file, transform=None):
+    def __init__(self, rootdir, source_file, transform=None, warp=True):
         self.rootdir = rootdir
         self.source_file = source_file
         self.transform = transform
+        self.warp = warp
+        if self.warp:
+            face_d, face_p = alignface.load_face_detector('models/shape_predictor_68_face_landmarks.dat')
+            self.detector = face_d
+            self.predictor = face_p
         with open(self.source_file, 'r') as f:
             self.source_file = f.readlines()
 
     def __getitem__(self, index):
+        # s = self.source_file[index].split()
+        # imgA = Image.open(os.path.join(self.rootdir, s[0])).convert('RGB')
+        # imgB = Image.open(os.path.join(self.rootdir, s[1])).convert('RGB')
+        # label = int(s[2])
+        # if self.transform != None:
+        #     imgA = self.transform(imgA)
+        #     imgB = self.transform(imgB)
+        # return imgA, imgB, torch.LongTensor(1).fill_(label).squeeze()
         s = self.source_file[index].split()
-        imgA = Image.open(os.path.join(self.rootdir, s[0])).convert('RGB')
-        imgB = Image.open(os.path.join(self.rootdir, s[1])).convert('RGB')
+        imgA = cv2.imread(os.path.join(self.rootdir, s[0]))
+        imgB = cv2.imread(os.path.join(self.rootdir, s[1]))
+        if self.warp:
+            lmA = alignface.detect_landmarks_from_image(imgA, self.detector, self.predictor)
+            lmB = alignface.detect_landmarks_from_image(imgB, self.detector, self.predictor)
+            if lmA is not None and lmB is not None:
+                M, _ = alignface.fit_face_landmarks(lmB, lmA, landmarks=list(range(68)))
+                imgB = alignface.warp_to_template(imgB, M, imgA.shape[:2])
         label = int(s[2])
+        imgA = Image.fromarray(cv2.cvtColor(imgA, cv2.COLOR_BGR2RGB))
+        imgB = Image.fromarray(cv2.cvtColor(imgB, cv2.COLOR_BGR2RGB))
         if self.transform != None:
             imgA = self.transform(imgA)
             imgB = self.transform(imgB)
@@ -230,17 +253,12 @@ class TVLoss(nn.Module):
 ###############################################################################
 # Networks and Models
 ###############################################################################
-# moved to models.networks
 class SiameseNetwork(nn.Module):
-    def __init__(self, base=None):
+    def __init__(self, base=None, facelet=None):
         super(SiameseNetwork, self).__init__()
         # base
         self.base = base
-
-        self.fc1 = nn.Conv2d(256, 1, kernel_size=56, stride=1, padding=0, bias=False)
-        self.fc2 = nn.Conv2d(512, 1, kernel_size=28, stride=1, padding=0, bias=False)
-        self.fc3 = nn.Conv2d(512, 1, kernel_size=14, stride=1, padding=0, bias=False)
-        self.fc_linear = nn.Conv2d(3, 1, kernel_size=1, stride=1, padding=0, bias=False)
+        self.facelet = facelet
 
     def forward_once(self, x):
         outputs = self.base.forward(x)
@@ -250,43 +268,21 @@ class SiameseNetwork(nn.Module):
         feature1 = self.forward_once(input1)
         feature2 = self.forward_once(input2)
 
-        output = torch.cat([self.fc1.forward(feature1[0]-feature2[0]),
-                            self.fc2.forward(feature1[1]-feature2[1]),
-                            self.fc3.forward(feature1[2]-feature2[2])], 1)
-        output = self.fc_linear.forward(output)
+        delta1 = self.facelet.forward(feature1)
+        output = self.inner_prod(self.minus(feature1, feature2), delta1)
+        print(output)
 
         return feature1, feature2, output
 
-    def get_inner_prod(self, x):
-        feature = self.base.forward(x)
-        output = torch.cat([self.fc1.forward(feature[0]),
-                            self.fc2.forward(feature[1]),
-                            self.fc3.forward(feature[2])], 1)
-        output = self.fc_linear.forward(output)
-        return output
+    def minus(self, feat1, feat2):
+        return [f1 - f2 for f1, f2 in zip(feat1, feat2)]
 
-    def get_norm(self, p=2):
-        output = torch.sum(self.fc1.weight.data.pow(2) * self.fc_linear.weight.data[0, 0, 0, 0].pow(2)) + \
-                 torch.sum(self.fc2.weight.data.pow(2) * self.fc_linear.weight.data[0, 1, 0, 0].pow(2)) + \
-                 torch.sum(self.fc3.weight.data.pow(2) * self.fc_linear.weight.data[0, 2, 0, 0].pow(2))
-        output = math.sqrt(output.cpu().item())
-        return output
-
-    def get_heat_map(self, x):
-        feature = self.base.forward(x)
-        # feature_ = torch.cat([feature[0]*0, upsample2d(feature[1], 56)*1, upsample2d(feature[2], 56)*0], 1)
-        feature_ = feature[1]
-        heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
-        return heat_map
-
-    def get_heat_map_fc(self, x):
-        feature = [(self.fc1.weight.data * self.fc_linear.weight.data[0, 0, 0, 0]).clone(),
-                   (self.fc2.weight.data * self.fc_linear.weight.data[0, 1, 0, 0]).clone(),
-                   (self.fc3.weight.data * self.fc_linear.weight.data[0, 2, 0, 0]).clone()]
-        # feature_ = torch.cat([feature[0]*1, upsample2d(feature[1], 56)*1, upsample2d(feature[2], 56)*1], 1)
-        feature_ = feature[2]
-        heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
-        return heat_map
+    def inner_prod(self, feat1, feat2):
+        a = 0.0
+        n = feat1[0].size(0)
+        for f1, f2 in zip(feat1, feat2):
+            a += torch.sum(f1.view(n, -1) * f2.view(n, -1), dim=1)
+        return a.view(n, 1, 1, 1)
 
 
 ###############################################################################
@@ -408,12 +404,11 @@ def feature2image(image_tensor):
 ###############################################################################
 def get_model(opt):
     base = base_network.VGG(pretrained=True)
-    net = SiameseNetwork(base=base)
+    opt.pretrained = False
+    facelet = facelet_net.Facelet(opt)
+    net = SiameseNetwork(base=base, facelet=facelet)
     if opt.mode == 'train' and not opt.continue_train:
-        net.fc1.apply(weights_init)
-        net.fc2.apply(weights_init)
-        net.fc3.apply(weights_init)
-        net.fc_linear.weight.data.fill_(1.0)
+        print('>> weight not initialized')
     else:
         # HACK: strict=False
         net.load_state_dict(torch.load(os.path.join(opt.checkpoint_dir, opt.name, '{}_net.pth'.format(opt.which_epoch))), strict=True)
@@ -482,8 +477,8 @@ def train(opt, net, dataloader, dataloader_val=None):
 
     # optimizer
     if opt.finetune_fc_only:
-        optimizer = optim.Adam(itertools.chain(net.fc1.parameters(), net.fc2.parameters(), net.fc3.parameters(),
-                                               net.fc_linear.parameters()), lr=opt.lr)
+        optimizer = optim.Adam(itertools.chain(net.facelet.parameters()), lr=opt.lr)
+        set_requires_grad(net.base, False)
     else:
         optimizer = optim.Adam(net.parameters(), lr=opt.lr)
 
@@ -496,7 +491,7 @@ def train(opt, net, dataloader, dataloader_val=None):
     if opt.lambda_contrastive > 0:
         loss_legend.append('contrastive')
     if opt.lambda_regularization > 0:
-        loss_legend.append('regularization')
+        loss_legend.append('L2')
     if opt.display_id >= 0:
         import visdom
         vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
@@ -543,13 +538,19 @@ def train(opt, net, dataloader, dataloader_val=None):
                 loss += this_loss
                 losses['contrastive'] = this_loss.item()
             
-            # regularization
+            # # regularization
+            # if opt.lambda_regularization > 0:
+            #     reg1 = feat1.pow(2).mean()
+            #     reg2 = feat2.pow(2).mean()
+            #     this_loss = (reg1 + reg2) * opt.lambda_regularization
+            #     loss += this_loss
+            #     losses['regularization'] = this_loss.item()
+
+            # regularization of a
             if opt.lambda_regularization > 0:
-                reg1 = feat1.pow(2).mean()
-                reg2 = feat2.pow(2).mean()
-                this_loss = (reg1 + reg2) * opt.lambda_regularization
+                this_loss = score.pow(2).mean() * opt.lambda_regularization
                 loss += this_loss
-                losses['regularization'] = this_loss.item()
+                losses['L2'] = this_loss.item()
 
             # get predictions
             pred_train.append(get_prediction(score, opt.draw_prob_thresh))

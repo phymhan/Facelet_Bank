@@ -484,6 +484,7 @@ def train(opt, net, dataloader, dataloader_val=None):
     if opt.finetune_fc_only:
         optimizer = optim.Adam(itertools.chain(net.fc1.parameters(), net.fc2.parameters(), net.fc3.parameters(),
                                                net.fc_linear.parameters()), lr=opt.lr)
+        set_requires_grad(net.base, False)
     else:
         optimizer = optim.Adam(net.parameters(), lr=opt.lr)
 

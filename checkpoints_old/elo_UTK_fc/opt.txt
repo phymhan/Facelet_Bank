@@ -1,12 +1,12 @@
 --------------- Options -----------------
             affineDegrees: 5                             
               affineScale: [0.95, 1.05]                  
-               batch_size: 10                            	[default: 100]
+               batch_size: 25                            	[default: 100]
            checkpoint_dir: checkpoints                   
                   cnn_dim: [64, 1]                       
                   cnn_pad: 1                             
            cnn_relu_slope: 0.7                           
-           continue_train: True                          	[default: False]
+           continue_train: False                         
                  datafile: ../ws-gan/sourcefiles/UTK_pairs_train.txt	[default: ]
              datafile_val: ../ws-gan/sourcefiles/UTK_pairs_val.txt	[default: ]
                  dataroot: datasets/UTK                  	[default: datasets/UTKFace]
@@ -30,7 +30,7 @@
                        lr: 0.0002                        
                      mode: train                         
                  n_layers: 3                             
-                     name: elo_UTK                       	[default: exp]
+                     name: elo_UTK_fc                    	[default: exp]
                        nf: 64                            
                    no_cxn: False                         
                   no_flip: False                         
