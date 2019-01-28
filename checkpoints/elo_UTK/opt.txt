@@ -1,7 +1,7 @@
 --------------- Options -----------------
             affineDegrees: 5                             
               affineScale: [0.95, 1.05]                  
-               batch_size: 20                            	[default: 100]
+               batch_size: 25                            	[default: 100]
            checkpoint_dir: checkpoints                   
                   cnn_dim: [64, 1]                       
                   cnn_pad: 1                             
