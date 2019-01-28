@@ -7,7 +7,7 @@
 !examples/input.mp4
 !/images/*
 !.gitignore
-checkpoints/
+checkpoints*/
 datasets/
 images/
 results/
