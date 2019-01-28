@@ -270,7 +270,6 @@ class SiameseNetwork(nn.Module):
 
         delta1 = self.facelet.forward(feature1)
         output = self.inner_prod(self.minus(feature1, feature2), delta1)
-        print(output)
 
         return feature1, feature2, output
 
