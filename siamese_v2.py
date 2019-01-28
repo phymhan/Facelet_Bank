@@ -81,7 +81,7 @@ class Options():
         parser.add_argument('--save_latest_freq', type=int, default=100, help='frequency of saving the latest results')
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
         parser.add_argument('--draw_prob_thresh', type=float, default=0.16)
-
+        parser.add_argument('--feature_norm', type=str, default='group')
         return parser
 
     def get_options(self):
@@ -254,35 +254,38 @@ class TVLoss(nn.Module):
 # Networks and Models
 ###############################################################################
 class SiameseNetwork(nn.Module):
-    def __init__(self, base=None, facelet=None):
+    def __init__(self, base=None, facelet=None, norm='group'):
         super(SiameseNetwork, self).__init__()
         # base
         self.base = base
         self.facelet = facelet
+        self.norm = norm
 
     def forward_once(self, x):
         outputs = self.base.forward(x)
         return outputs
 
     def forward(self, input1, input2):
-        feature1 = self.forward_once(input1)
-        feature2 = self.forward_once(input2)
+        feat1 = self.forward_once(input1)
+        feat2 = self.forward_once(input2)
 
-        delta1 = self.get_delta(feature1)
-        output = self.inner_prod(self.minus(feature1, feature2), delta1)
+        delta1 = self.get_delta(feat1)
+        a = self.inner_prod(self.minus(feat1, feat2), delta1)
 
-        return feature1, feature2, output
+        return feat1, feat2, a
 
     def get_delta(self, feat):
         delta = self.facelet.forward(feat)
-        # group normalize
-        delta = [f/torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt().view(f.size(0), 1, 1, 1) for f in delta]
-        # concat normalize
-        norm = torch.sum(delta[0].pow(2).view(delta[0].size(0), -1), dim=1) + \
-               torch.sum(delta[1].pow(2).view(delta[1].size(0), -1), dim=1) + \
-               torch.sum(delta[2].pow(2).view(delta[2].size(0), -1), dim=1)
-        norm = norm.sqrt().view(norm.size(0), 1, 1, 1)
-        delta = delta/norm
+        if self.norm == 'group':
+            # group normalize
+            delta = [f/torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt().view(f.size(0), 1, 1, 1) for f in delta]
+        elif self.norm == 'concat':
+            # concat normalize
+            norm = torch.sum(delta[0].pow(2).view(delta[0].size(0), -1), dim=1) + \
+                   torch.sum(delta[1].pow(2).view(delta[1].size(0), -1), dim=1) + \
+                   torch.sum(delta[2].pow(2).view(delta[2].size(0), -1), dim=1)
+            norm = norm.sqrt().view(norm.size(0), 1, 1, 1)
+            delta = delta/norm
         return delta
 
     def minus(self, feat1, feat2):
@@ -295,14 +298,15 @@ class SiameseNetwork(nn.Module):
             a += torch.sum(f1.view(n, -1) * f2.view(n, -1), dim=1)
         return a.view(n, 1, 1, 1)
 
-    def normalize(self, feat):
-
-        return []
+    def get_inner_prod(self, x):
+        feat = self.forward_once(x)
+        delta = self.get_delta(feat)
+        a = self.inner_prod(feat, delta)
+        return a
 
     def get_heat_map(self, x):
         feat = self.base.forward(x)
-        # feature_ = torch.cat([feature[0]*0, upsample2d(feature[1], 56)*1, upsample2d(feature[2], 56)*0], 1)
-
+        # feature_ = torch.cat([feat[0]*0, upsample2d(feat[1], 56)*1, upsample2d(feat[2], 56)*0], 1)
         feature_ = feat[1]
         heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
         return heat_map
@@ -310,8 +314,8 @@ class SiameseNetwork(nn.Module):
     def get_heat_map_fc(self, x):
         feat = self.base.forward(x)
         delta = self.get_delta(feat)
-        feature_ = torch.cat([delta[0]*1, upsample2d(delta[1], 56)*1, upsample2d(delta[2], 56)*1], 1)
-        # feature_ = delta[1]
+        # feature_ = torch.cat([delta[0]*1, upsample2d(delta[1], 56)*1, upsample2d(delta[2], 56)*1], 1)
+        feature_ = delta[1]
         heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
         return heat_map
 
@@ -437,7 +441,7 @@ def get_model(opt):
     base = base_network.VGG(pretrained=True)
     opt.pretrained = False
     facelet = facelet_net.Facelet(opt)
-    net = SiameseNetwork(base=base, facelet=facelet)
+    net = SiameseNetwork(base=base, facelet=facelet, norm=opt.feature_norm)
     if opt.mode == 'train' and not opt.continue_train:
         print('>> weight not initialized')
         net.facelet.apply(weights_init)
