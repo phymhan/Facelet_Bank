@@ -21,8 +21,12 @@ parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--root', type=str, default='/media/ligong/Passport/Datasets/SCUT-FBP/images_renamed')
 parser.add_argument('--input', type=str, default='/media/ligong/Passport/Datasets/SCUT-FBP/train_all_scut-fbp.txt')
 parser.add_argument('--output', type=str, default='/media/ligong/Passport/Datasets/SCUT-FBP/landmarks_renamed')
+parser.add_argument('--error_file', type=str, default='non_face.txt')
 parser.add_argument('-p', '--shape-predictor', default='shape_predictor_68_face_landmarks.dat', help='path to facial landmark predictor')
 opt = parser.parse_args()
+
+if not os.path.exists(opt.output):
+    os.mkdir(opt.output)
 
 # initialize dlib's face detector (HOG-based) and then create
 # the facial landmark predictor
@@ -32,6 +36,9 @@ predictor = dlib.shape_predictor(opt.shape_predictor)
 with open(opt.input, 'r') as f:
     image_list = [l.rstrip('\n') for l in f.readlines()]
 
+cnt = 0
+err_list = []
+
 for filename in image_list:
     # load the input image, resize it, and convert it to grayscale
     image = cv2.imread(os.path.join(opt.root, filename))
@@ -40,8 +47,17 @@ for filename in image_list:
     
     # detect faces in the grayscale image
     rects = detector(gray, 1)
-
-    shape = predictor(gray, rects[0])
-    shape_to_file(shape, os.path.join(opt.output, '%s.landmark' % filename))
+    if len(rects) > 0:
+        shape = predictor(gray, rects[0])
+        shape_to_file(shape, os.path.join(opt.output, '%s.landmark' % filename))
+    else:
+        cnt += 1
+        err_list.append(filename)
 
     print('-> %s' % filename)
+
+print('# of non-face: %d' % cnt)
+
+with open(opt.error_file, 'w') as f:
+    for l in err_list:
+        f.write(l+'\n')

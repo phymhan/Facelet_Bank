@@ -6,6 +6,7 @@ import functools
 from torch.optim import lr_scheduler
 import numpy as np
 from util.util import upsample2d
+import itertools
 
 ###############################################################################
 # Helper Functions
@@ -761,6 +762,16 @@ class SiameseNetwork(nn.Module):
         # used when loading pretrained base model
         # warning: self.cnn and self.fc won't be initialized
         self.base.load_pretrained(state_dict)
+
+    def get_finetune_parameters(self):
+        params = []
+        if self.stn:
+            params += self.stn.parameters()
+        if self.cnn:
+            params += self.cnn.parameters()
+        if self.cxn:
+            params += self.cxn.parameters()
+        return itertools.chain(params)
 
 
 class SiameseFeature(nn.Module):

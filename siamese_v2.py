@@ -26,6 +26,7 @@ from util.util import upsample2d
 import itertools
 import cv2
 from util import alignface
+from network.decoder import vgg_decoder
 
 
 ###############################################################################
@@ -81,7 +82,11 @@ class Options():
         parser.add_argument('--save_latest_freq', type=int, default=100, help='frequency of saving the latest results')
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
         parser.add_argument('--draw_prob_thresh', type=float, default=0.16)
-        parser.add_argument('--feature_norm', type=str, default='group')
+        parser.add_argument('--norm_layer', type=str, default='none')
+        parser.add_argument('--scale_feat', action='store_true')
+        parser.add_argument('--scale_delta', action='store_true')
+        parser.add_argument('--norm_feat', type=str, default='group')
+        parser.add_argument('--norm_delta', type=str, default='group')
         return parser
 
     def get_options(self):
@@ -122,15 +127,18 @@ class Options():
 class SiameseNetworkDataset(Dataset):
     def __init__(self, rootdir, source_file, transform=None, warp=True):
         self.rootdir = rootdir
+        self.landmarkdir = rootdir.rstrip('/').rstrip('\\') + '_landmark'
         self.source_file = source_file
         self.transform = transform
         self.warp = warp
+        self.precompute_landmark = os.path.exists(self.landmarkdir)
+        with open(self.source_file, 'r') as f:
+            self.source_file = f.readlines()
         if self.warp:
             face_d, face_p = alignface.load_face_detector('models/shape_predictor_68_face_landmarks.dat')
             self.detector = face_d
             self.predictor = face_p
-        with open(self.source_file, 'r') as f:
-            self.source_file = f.readlines()
+            self.M_pool = [None for _ in range(self.__len__())]
 
     def __getitem__(self, index):
         # s = self.source_file[index].split()
@@ -145,10 +153,18 @@ class SiameseNetworkDataset(Dataset):
         imgA = cv2.imread(os.path.join(self.rootdir, s[0]))
         imgB = cv2.imread(os.path.join(self.rootdir, s[1]))
         if self.warp:
-            lmA = alignface.detect_landmarks_from_image(imgA, self.detector, self.predictor)
-            lmB = alignface.detect_landmarks_from_image(imgB, self.detector, self.predictor)
+            if self.precompute_landmark:
+                lmA = self.load_landmark(os.path.join(self.landmarkdir, s[0] + '.landmark'))
+                lmB = self.load_landmark(os.path.join(self.landmarkdir, s[1] + '.landmark'))
+            else:
+                lmA = alignface.detect_landmarks_from_image(imgA, self.detector, self.predictor)
+                lmB = alignface.detect_landmarks_from_image(imgB, self.detector, self.predictor)
             if lmA is not None and lmB is not None:
-                M, _ = alignface.fit_face_landmarks(lmB, lmA, landmarks=list(range(68)))
+                if self.M_pool[index] is None:
+                    M, _ = alignface.fit_face_landmarks(lmB, lmA, landmarks=list(range(68)))
+                    self.M_pool[index] = M
+                else:
+                    M = self.M_pool[index]
                 imgB = alignface.warp_to_template(imgB, M, imgA.shape[:2])
         label = int(s[2])
         imgA = Image.fromarray(cv2.cvtColor(imgA, cv2.COLOR_BGR2RGB))
@@ -162,6 +178,11 @@ class SiameseNetworkDataset(Dataset):
         # # shuffle source file
         # random.shuffle(self.source_file)
         return len(self.source_file)
+
+    def load_landmark(self, p):
+        with open(p, 'r') as f:
+            l = f.readlines()
+        return np.array([[float(l_.split()[0]), float(l_.split()[1].rstrip('\n'))] for l_ in l])
 
 
 class SingleImageDataset(Dataset):
@@ -253,69 +274,109 @@ class TVLoss(nn.Module):
 ###############################################################################
 # Networks and Models
 ###############################################################################
+def _scale(feat):
+    numel = 0.0
+    for f in feat:
+        numel += f.size(1)
+    return [f/numel for f in feat]
+
+
+def _normalize(feat, norm):
+    if norm == 'group':
+        # group normalize
+        feat = [f/torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt().view(f.size(0), 1, 1, 1) for f in feat]
+    elif norm == 'concat':
+        # concat normalize
+        norm = torch.sum(feat[0].pow(2).view(feat[0].size(0), -1), dim=1) + \
+               torch.sum(feat[1].pow(2).view(feat[1].size(0), -1), dim=1) + \
+               torch.sum(feat[2].pow(2).view(feat[2].size(0), -1), dim=1)
+        norm = norm.sqrt().view(norm.size(0), 1, 1, 1)
+        feat = [f/norm for f in feat]
+    return feat
+
+
+def _minus(feat1, feat2):
+    return [f1 - f2 for f1, f2 in zip(feat1, feat2)]
+
+
+def _inner_prod(feat1, feat2):
+    a = 0.0
+    n = feat1[0].size(0)
+    for f1, f2 in zip(feat1, feat2):
+        a += torch.sum(f1.view(n, -1) * f2.view(n, -1), dim=1)
+    return a.view(n, 1, 1, 1)
+
+
 class SiameseNetwork(nn.Module):
-    def __init__(self, base=None, facelet=None, norm='group'):
+    def __init__(self, base=None, facelet=None, scale_feat=True, scale_delta=True, norm_feat='group', norm_delta='group'):
         super(SiameseNetwork, self).__init__()
         # base
         self.base = base
         self.facelet = facelet
-        self.norm = norm
+        self.norm_feat = norm_feat
+        self.norm_delta = norm_delta
+        self.scale_feat = scale_feat
+        self.scale_delta = scale_delta
 
-    def forward_once(self, x):
-        outputs = self.base.forward(x)
-        return outputs
+    def _process_feature(self, feat, scale=True, norm='group'):
+        if scale:
+            feat = _scale(feat)
+        feat = _normalize(feat, norm)
+        return feat
 
-    def forward(self, input1, input2):
-        feat1 = self.forward_once(input1)
-        feat2 = self.forward_once(input2)
+    def get_feature(self, x):
+        feat = self.base.forward(x)
+        return feat
+
+    def forward(self, x1, x2):
+        feat1 = self.get_feature(x1)
+        feat2 = self.get_feature(x2)
 
         delta1 = self.get_delta(feat1)
-        a = self.inner_prod(self.minus(feat1, feat2), delta1)
+        feat_diff = _minus(feat1, feat2)
+
+        feat_diff = self._process_feature(feat_diff, self.scale_feat, self.norm_feat)
+        delta1 = self._process_feature(delta1, self.scale_delta, self.norm_delta)
+
+        a = _inner_prod(feat_diff, delta1)
+        # print(a)
 
         return feat1, feat2, a
 
     def get_delta(self, feat):
         delta = self.facelet.forward(feat)
-        if self.norm == 'group':
-            # group normalize
-            delta = [f/torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt().view(f.size(0), 1, 1, 1) for f in delta]
-        elif self.norm == 'concat':
-            # concat normalize
-            norm = torch.sum(delta[0].pow(2).view(delta[0].size(0), -1), dim=1) + \
-                   torch.sum(delta[1].pow(2).view(delta[1].size(0), -1), dim=1) + \
-                   torch.sum(delta[2].pow(2).view(delta[2].size(0), -1), dim=1)
-            norm = norm.sqrt().view(norm.size(0), 1, 1, 1)
-            delta = delta/norm
         return delta
 
-    def minus(self, feat1, feat2):
-        return [f1 - f2 for f1, f2 in zip(feat1, feat2)]
-
-    def inner_prod(self, feat1, feat2):
-        a = 0.0
-        n = feat1[0].size(0)
-        for f1, f2 in zip(feat1, feat2):
-            a += torch.sum(f1.view(n, -1) * f2.view(n, -1), dim=1)
-        return a.view(n, 1, 1, 1)
-
     def get_inner_prod(self, x):
-        feat = self.forward_once(x)
+        feat = self.get_feature(x)
         delta = self.get_delta(feat)
+
+        feat = self._process_feature(feat, self.scale_feat, self.norm_feat)
+        delta = self._process_feature(delta, self.scale_delta, self.norm_delta)
+
         a = self.inner_prod(feat, delta)
         return a
 
     def get_heat_map(self, x):
         feat = self.base.forward(x)
         # feature_ = torch.cat([feat[0]*0, upsample2d(feat[1], 56)*1, upsample2d(feat[2], 56)*0], 1)
-        feature_ = feat[1]
+        feature_ = feat[0]
         heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
         return heat_map
 
     def get_heat_map_fc(self, x):
         feat = self.base.forward(x)
+
+        norms = [torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt() for f in feat]
+        print(norms)
+
         delta = self.get_delta(feat)
-        # feature_ = torch.cat([delta[0]*1, upsample2d(delta[1], 56)*1, upsample2d(delta[2], 56)*1], 1)
-        feature_ = delta[1]
+
+        norms = [torch.sum(f.pow(2).view(f.size(0), -1), dim=1).sqrt() for f in delta]
+        print(norms)
+
+        feature_ = torch.cat([delta[0]*1, upsample2d(delta[1], 56)*1, upsample2d(delta[2], 56)*1], 1)
+        # feature_ = delta[2]
         heat_map = torch.sum(feature_.pow(2), 1, keepdim=True)
         return heat_map
 
@@ -441,10 +502,12 @@ def get_model(opt):
     base = base_network.VGG(pretrained=True)
     opt.pretrained = False
     facelet = facelet_net.Facelet(opt)
-    net = SiameseNetwork(base=base, facelet=facelet, norm=opt.feature_norm)
+    net = SiameseNetwork(base=base, facelet=facelet,
+                         scale_feat=opt.scale_feat, scale_delta=opt.scale_delta,
+                         norm_feat=opt.norm_feat, norm_delta=opt.norm_delta)
     if opt.mode == 'train' and not opt.continue_train:
         print('>> weight not initialized')
-        net.facelet.apply(weights_init)
+        # net.facelet.apply(weights_init)
     else:
         # HACK: strict=False
         net.load_state_dict(torch.load(os.path.join(opt.checkpoint_dir, opt.name, '{}_net.pth'.format(opt.which_epoch))), strict=True)
@@ -456,6 +519,14 @@ def get_model(opt):
     if opt.use_gpu:
         net.cuda()
     return net
+
+
+def get_decoder(opt):
+    decoder = vgg_decoder()
+    if opt.use_gpu:
+        decoder.cuda()
+
+    return decoder
 
 
 def get_transform(opt):
@@ -554,7 +625,7 @@ def train(opt, net, dataloader, dataloader_val=None):
             optimizer.zero_grad()
 
             # net forward
-            feat1, feat2, score = net(img0, img1)
+            feat1, feat2, score = net(Variable(img0), Variable(img1))
 
             losses = {}
             # classification loss
@@ -631,7 +702,7 @@ def train(opt, net, dataloader, dataloader_val=None):
                 img0, img1, label = data
                 if opt.use_gpu:
                     img0, img1 = img0.cuda(), img1.cuda()
-                _, _, output = net.forward(img0, img1)
+                _, _, output = net.forward(Variable(img0), Variable(img1))
                 pred_val.append(get_prediction(output, opt.draw_prob_thresh))
                 target_val.append(label.cpu().numpy())
             err_val = np.count_nonzero(np.concatenate(pred_val) - np.concatenate(target_val)) / dataset_size_val
@@ -724,6 +795,31 @@ def heatmap_fc(opt, net, dataloader):
         vis.images(images, win=opt.display_id + 10)
 
 
+def F_decode(opt, net, decoder, dataloader):
+    import visdom
+    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
+
+    delta = -0.003
+
+    for i, data in enumerate(dataloader, 0):
+        img0, path0 = data
+        if opt.use_gpu:
+            img0 = img0.cuda()
+        emb0 = net.forward_once(img0)
+        W1, W2, W3 = net.get_delta(emb0)
+        emb1 = [emb0[0] + W1 * delta, emb0[1] + W2 * delta * 1, emb0[2] + W3 * delta * 1]
+
+        img1 = decoder.forward(emb1, img0)
+
+        images = []
+        images += [tensor2image(img0.detach())]
+        images += [tensor2image(img1.detach())]
+        vis.images(images, win=opt.display_id + 10)
+
+        # save_image(images[0], 'results/image_%d_A.png' % i)
+        # save_image(images[1], 'results/image_%d_B.png' % i)
+
+
 def F_inverse(opt, net, dataloader):
     import visdom
     vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
@@ -735,15 +831,15 @@ def F_inverse(opt, net, dataloader):
     # else:
     #     netIP.load_pretrained(opt.pretrained_model_path_IP)
 
-    delta = -1
+    delta = -0.1
 
     for i, data in enumerate(dataloader, 0):
         img0, path0 = data
         if opt.use_gpu:
             img0 = img0.cuda()
-        emb0 = net.forward_once(img0)
+        emb0 = net.get_feature(img0)
         W1, W2, W3 = net.get_delta(emb0)
-        emb1 = [emb0[0]+W1*delta, emb0[1]+W2*delta, emb0[2]+W3*delta]
+        emb1 = [emb0[0]+W1*delta, emb0[1]+W2*delta*1, emb0[2]+W3*delta*1]
 
         img1 = optimize_image(img0, emb1, net, None, opt)
 
@@ -775,7 +871,7 @@ def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
     # cat_features = F.view(-1)
     # features = tuple(Variable(cat_features[int(start_i):int(end_i)].view(size)).cuda()
     #                  for size, start_i, end_i in zip(sizes, cat_offsets[:-1], cat_offsets[1:]))
-    features = F
+    features = [f.clone() for f in F]
 
     # Create optimizer and loss functions
     optimizer = optim.LBFGS(
@@ -796,12 +892,12 @@ def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
         # OR #
         # optimizer.zero_grad()
 
-        output_var = net.forward_once(recon_var)
+        output_var = net.get_feature(recon_var)
         loss3 = criterion3(output_var[0], features[0])
         loss4 = criterion4(output_var[1], features[1])
         loss5 = criterion5(output_var[2], features[2])
         loss_tv = tv_lambda * criterion_tv(recon_var)
-        loss = loss3 + loss4 + loss5 + loss_tv
+        loss = loss3*1 + loss4*1 + loss5*1 + loss_tv
         loss.backward()
 
         if optimizer.n_steps % 25 == 0:
@@ -997,6 +1093,12 @@ if __name__=='__main__':
         dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
         # get embedding
         embedding(opt, net, dataloader)
+    elif opt.mode == 'decode':
+        # get dataloader
+        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
+        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
+        decoder = get_decoder(opt)
+        F_decode(opt, net, decoder, dataloader)
     elif opt.mode == 'inverse':
         # get dataloader
         dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))

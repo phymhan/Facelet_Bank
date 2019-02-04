@@ -7,6 +7,7 @@ from util import opt
 import functools
 from . import base_network
 from global_vars import *
+from network.networks import get_norm_layer
 
 
 class Facelet(base_network.BaseModel, nn.Module):
@@ -14,6 +15,7 @@ class Facelet(base_network.BaseModel, nn.Module):
         super(Facelet, self).__init__()
         self._default_opt()
         self.opt = self.opt.merge_opt(opt)
+        self.norm_layer = get_norm_layer(self.opt.norm_layer)
         self._define_model()
         self._define_optimizer()
         if self.opt.pretrained:
@@ -29,12 +31,13 @@ class Facelet(base_network.BaseModel, nn.Module):
         self.opt.lr = 1e-4
         self.opt.pretrained = True
         self.opt.effect = 'facehair'
+        self.opt.norm_layer = 'instance'
 
     def _define_model(self):
         self.model = nn.Module()
-        self.model.w_1 = simpleCNNGenerator(256, 256)
-        self.model.w_2 = simpleCNNGenerator(512, 512)
-        self.model.w_3 = simpleCNNGenerator(512, 512)
+        self.model.w_1 = simpleCNNGenerator(256, 256, norm_layer=self.norm_layer)
+        self.model.w_2 = simpleCNNGenerator(512, 512, norm_layer=self.norm_layer)
+        self.model.w_3 = simpleCNNGenerator(512, 512, norm_layer=self.norm_layer)
 
     def _define_optimizer(self):
         self.schedulers = []
@@ -102,6 +105,7 @@ class simpleCNNGenerator(nn.Module):
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
+        print('norm_layer:', norm_layer)
         if norm_layer is not None:
             model = [nn.ReflectionPad2d(1),
                      nn.Conv2d(input_nc, ngf, kernel_size=3, padding=0,
