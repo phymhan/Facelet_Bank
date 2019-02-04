@@ -135,9 +135,10 @@ class SiameseNetworkDataset(Dataset):
         with open(self.source_file, 'r') as f:
             self.source_file = f.readlines()
         if self.warp:
-            face_d, face_p = alignface.load_face_detector('models/shape_predictor_68_face_landmarks.dat')
-            self.detector = face_d
-            self.predictor = face_p
+            if not self.precompute_landmark:
+                face_d, face_p = alignface.load_face_detector('models/shape_predictor_68_face_landmarks.dat')
+                self.detector = face_d
+                self.predictor = face_p
             self.M_pool = [None for _ in range(self.__len__())]
 
     def __getitem__(self, index):
