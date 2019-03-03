@@ -76,7 +76,7 @@ class Options():
         parser.add_argument('--scale_delta', action='store_true')
         parser.add_argument('--norm_feat', type=str, default='group')
         parser.add_argument('--norm_delta', type=str, default='group')
-        parser.add_argument('--criterion_rec', type='str', default='mse')
+        parser.add_argument('--criterion_rec', type=str, default='mse')
         return parser
 
     def get_options(self):
