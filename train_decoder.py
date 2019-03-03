@@ -579,9 +579,9 @@ def train(opt, vgg, decoder, dataloader, dataloader_val=None):
         os.makedirs(os.path.join(opt.save_dir, 'images'))
     
     # criterion
-    if opt.criterion == 'mse':
+    if opt.criterion_rec == 'mse':
         criterionRec = torch.nn.MSELoss()
-    elif opt.criterion == 'l1':
+    elif opt.criterion_rec == 'l1':
         criterionRec = torch.nn.L1Loss()
     criterionFM = FMLoss(opt.weight)
 
