@@ -185,17 +185,49 @@ class Vgg_recon(nn.Module):
         return recon0
 
 
+#
+# class _PoolingBlock(nn.Sequential):
+#     def __init__(self, n_convs, n_input_filters, n_output_filters, drop_rate):
+#         super(_PoolingBlock, self).__init__()
+#         for i in range(n_convs):
+#             self.add_module('conv.%d' % (i + 1),
+#                             nn.Conv2d(n_input_filters if i == 0 else n_output_filters, n_output_filters, kernel_size=3,
+#                                       padding=1))
+#             # self.add_module('norm.%d' % (i+1), nn.BatchNorm2d(n_output_filters)) # xtao
+#             self.add_module('norm.%d' % (i + 1), nn.BatchNorm2d(n_output_filters))
+#             self.add_module('relu.%d' % (i + 1), nn.ReLU(inplace=True))
+#             if drop_rate > 0:
+#                 self.add_module('drop.%d' % (i + 1), nn.Dropout(p=drop_rate))
+#
+#
+# class _TransitionUp(nn.Sequential):
+#     def __init__(self, n_input_filters, n_output_filters):
+#         super(_TransitionUp, self).__init__()
+#         self.add_module('unpool.conv',
+#                         nn.ConvTranspose2d(n_input_filters, n_output_filters, kernel_size=4, stride=2, padding=1))
+#         # self.add_module('interp.conv', nn.Conv2d(n_input_filters, n_output_filters, kernel_size=3, padding=1))
+#         self.add_module('unpool.norm', nn.BatchNorm2d(n_output_filters))
+#
+#
+# class _Upsample(nn.Sequential):
+#     def __init__(self, n_input_filters, n_output_filters):
+#         super(_Upsample, self).__init__()
+#         # self.add_module('unpool.conv', nn.ConvTranspose2d(n_input_filters, n_output_filters, kernel_size=4, stride=2, padding=1))
+#         self.add_module('interp.conv', nn.Conv2d(n_input_filters, n_output_filters, kernel_size=3, padding=1))
+#         self.add_module('interp.norm', nn.BatchNorm2d(n_output_filters))
 
+
+# replace dot with underscore
 class _PoolingBlock(nn.Sequential):
     def __init__(self, n_convs, n_input_filters, n_output_filters, drop_rate):
         super(_PoolingBlock, self).__init__()
         for i in range(n_convs):
-            self.add_module('conv.%d' % (i + 1),
+            self.add_module('conv_%d' % (i + 1),
                             nn.Conv2d(n_input_filters if i == 0 else n_output_filters, n_output_filters, kernel_size=3,
                                       padding=1))
             # self.add_module('norm.%d' % (i+1), nn.BatchNorm2d(n_output_filters)) # xtao
-            self.add_module('norm.%d' % (i + 1), nn.BatchNorm2d(n_output_filters))
-            self.add_module('relu.%d' % (i + 1), nn.ReLU(inplace=True))
+            self.add_module('norm_%d' % (i + 1), nn.BatchNorm2d(n_output_filters))
+            self.add_module('relu_%d' % (i + 1), nn.ReLU(inplace=True))
             if drop_rate > 0:
                 self.add_module('drop.%d' % (i + 1), nn.Dropout(p=drop_rate))
 
@@ -203,17 +235,15 @@ class _PoolingBlock(nn.Sequential):
 class _TransitionUp(nn.Sequential):
     def __init__(self, n_input_filters, n_output_filters):
         super(_TransitionUp, self).__init__()
-        self.add_module('unpool.conv',
+        self.add_module('unpool_conv',
                         nn.ConvTranspose2d(n_input_filters, n_output_filters, kernel_size=4, stride=2, padding=1))
         # self.add_module('interp.conv', nn.Conv2d(n_input_filters, n_output_filters, kernel_size=3, padding=1))
-        self.add_module('unpool.norm', nn.BatchNorm2d(n_output_filters))
+        self.add_module('unpool_norm', nn.BatchNorm2d(n_output_filters))
 
 
 class _Upsample(nn.Sequential):
     def __init__(self, n_input_filters, n_output_filters):
         super(_Upsample, self).__init__()
         # self.add_module('unpool.conv', nn.ConvTranspose2d(n_input_filters, n_output_filters, kernel_size=4, stride=2, padding=1))
-        self.add_module('interp.conv', nn.Conv2d(n_input_filters, n_output_filters, kernel_size=3, padding=1))
-        self.add_module('interp.norm', nn.BatchNorm2d(n_output_filters))
-
-
+        self.add_module('interp_conv', nn.Conv2d(n_input_filters, n_output_filters, kernel_size=3, padding=1))
+        self.add_module('interp_norm', nn.BatchNorm2d(n_output_filters))

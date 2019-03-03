@@ -53,22 +53,12 @@ class Options():
         parser.add_argument('--which_model', type=str, default='resnet18', help='which model')
         parser.add_argument('--n_layers', type=int, default=3, help='only used if which_model==n_layers')
         parser.add_argument('--nf', type=int, default=64, help='# of filters in first conv layer')
-        parser.add_argument('--pooling', type=str, default='avg', help='empty: no pooling layer, max: MaxPool, avg: AvgPool')
         parser.add_argument('--loadSize', type=int, default=240, help='scale images to this size')
         parser.add_argument('--fineSize', type=int, default=224, help='scale images to this size')
         parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
-        parser.add_argument('--weight', nargs='+', type=float, default=[], help='weights for CE')
+        parser.add_argument('--weight', nargs='+', type=float, default=[], help='weights for FM loss')
         parser.add_argument('--dropout', type=float, default=0.05, help='dropout p')
-        parser.add_argument('--finetune_fc_only', action='store_true', help='fix feature extraction weights and finetune fc layers only, if True')
-        parser.add_argument('--fc_dim', type=int, nargs='*', default=[], help='dimension of fc')
-        parser.add_argument('--fc_relu_slope', type=float, default=0.3)
-        parser.add_argument('--fc_residual', action='store_true', help='use residual fc')
-        parser.add_argument('--cnn_dim', type=int, nargs='+', default=[64, 1], help='cnn kernel dims for feature dimension reduction')
-        parser.add_argument('--cnn_pad', type=int, default=1, help='padding of cnn layers defined by cnn_dim')
-        parser.add_argument('--cnn_relu_slope', type=float, default=0.7)
-        parser.add_argument('--no_cxn', action='store_true', help='if true, do **not** add batchNorm and ReLU between cnn and fc')
-        parser.add_argument('--lambda_regularization', type=float, default=0.0, help='weight for feature regularization loss')
-        parser.add_argument('--lambda_contrastive', type=float, default=0.0, help='weight for contrastive loss')
+        parser.add_argument('--lambda_FM', type=float, default=0.0, help='weight for feature matching loss')
         parser.add_argument('--print_freq', type=int, default=10, help='print loss every print_freq iterations')
         parser.add_argument('--display_id', type=int, default=1, help='visdom window id, to disable visdom set id = -1.')
         parser.add_argument('--display_port', type=int, default=8097)
@@ -81,12 +71,12 @@ class Options():
         parser.add_argument('--epoch_count', type=int, default=1, help='starting epoch')
         parser.add_argument('--save_latest_freq', type=int, default=100, help='frequency of saving the latest results')
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
-        parser.add_argument('--draw_prob_thresh', type=float, default=0.16)
         parser.add_argument('--norm_layer', type=str, default='none')
         parser.add_argument('--scale_feat', action='store_true')
         parser.add_argument('--scale_delta', action='store_true')
         parser.add_argument('--norm_feat', type=str, default='group')
         parser.add_argument('--norm_delta', type=str, default='group')
+        parser.add_argument('--criterion_rec', type='str', default='mse')
         return parser
 
     def get_options(self):
@@ -271,6 +261,20 @@ class TVLoss(nn.Module):
         sq_diff = torch.clamp(x_diff * x_diff + y_diff * y_diff, self.eps, 10000000)
         return torch.norm(sq_diff, self.beta / 2.0) ** (self.beta / 2.0)
 
+class FMLoss(nn.Module):
+    def __init__(self, weight=None):
+        super(FMLoss, self).__init__()
+        self.weight = weight if weight != None else [1.0, 1.0, 1.0]
+        self.criterion = torch.nn.MSELoss()
+
+    def forward(self, fz, fx):
+        loss = 0.0
+        for fz_, fx_, w_ in zip(fz, fx, self.weight):
+            fx_ = fx_.detach()
+            fx_.requires_grad = False
+            loss += self.criterion(fz_, fx_) * w_
+        return loss
+
 
 ###############################################################################
 # Networks and Models
@@ -400,23 +404,6 @@ def get_attr_value(fname):
     return float(fname.split('_')[0])
 
 
-# def get_prediction(score):
-#     batch_size = score.size(0)
-#     score_cpu = score.detach().cpu().numpy()
-#     pred = stats.mode(score_cpu.argmax(axis=1).reshape(batch_size, -1), axis=1)
-#     return pred[0].reshape(batch_size)
-def get_prediction(score, draw_thresh=0.1):
-    batch_size = score.size(0)
-    prob = torch.sigmoid(score)
-    idx1 = torch.abs(0.5-prob) < draw_thresh
-    idx0 = (prob > 0.5) & (1-idx1)
-    idx2 = (prob <= 0.5) & (1-idx1)
-    pred = idx0*0 + idx1*1 + idx2*2
-    pred_cpu = pred.detach().cpu().numpy()
-    pred = stats.mode(pred_cpu.reshape(batch_size, -1), axis=1)
-    return pred[0].reshape(batch_size)
-
-
 def set_requires_grad(nets, requires_grad=False):
     if not isinstance(nets, list):
         nets = [nets]
@@ -523,11 +510,17 @@ def get_model(opt):
 
 
 def get_decoder(opt):
-    decoder = vgg_decoder()
+    decoder = vgg_decoder(False)
     if opt.use_gpu:
         decoder.cuda()
-
     return decoder
+
+def get_vgg(opt):
+    vgg = base_network.VGG(pretrained=True)
+    set_requires_grad(vgg, False)
+    if opt.use_gpu:
+        vgg.cuda()
+    return vgg
 
 
 def get_transform(opt):
@@ -572,97 +565,74 @@ def get_transform(opt):
     return transforms.Compose(transform_list)
 
 
+def forward(image, vgg, decoder):
+    vgg_feat = vgg.forward(image)
+    return decoder.forward(vgg_feat, image)
+
+
 # Routines for training
-def train(opt, net, dataloader, dataloader_val=None):
-    if opt.lambda_contrastive > 0:
-        criterion_constrastive = networks.ContrastiveLoss()
+def train(opt, vgg, decoder, dataloader, dataloader_val=None):
     opt.save_dir = os.path.join(opt.checkpoint_dir, opt.name)
     if not os.path.exists(opt.save_dir):
         os.makedirs(opt.save_dir)
+    if opt.display_id >= 0 and not os.path.exists(os.path.join(opt.save_dir, 'images')):
+        os.makedirs(os.path.join(opt.save_dir, 'images'))
     
     # criterion
-    criterion = networks.BinaryCrossEntropyLoss()
+    if opt.criterion == 'mse':
+        criterionRec = torch.nn.MSELoss()
+    elif opt.criterion == 'l1':
+        criterionRec = torch.nn.L1Loss()
+    criterionFM = FMLoss(opt.weight)
 
     # optimizer
-    if opt.finetune_fc_only:
-        optimizer = optim.Adam(itertools.chain(net.facelet.parameters()), lr=opt.lr)
-        set_requires_grad(net.base, False)
-    else:
-        optimizer = optim.Adam(net.parameters(), lr=opt.lr)
+    optimizer = optim.Adam(decoder.parameters(), lr=opt.lr)
 
     dataset_size, dataset_size_val = opt.dataset_size, opt.dataset_size_val
     loss_history = []
     total_iter = 0
     num_iter_per_epoch = math.ceil(dataset_size / opt.batch_size)
     opt.display_val_acc = not not dataloader_val
-    loss_legend = ['classification']
-    if opt.lambda_contrastive > 0:
-        loss_legend.append('contrastive')
-    if opt.lambda_regularization > 0:
-        loss_legend.append('L2')
+    loss_legend = ['Rec']
+    if opt.lambda_FM > 0:
+        loss_legend.append('FM')
     if opt.display_id >= 0:
         import visdom
         vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
         plot_loss = {'X': [], 'Y': [], 'leg': loss_legend}
-        plot_acc = {'X': [], 'Y': [], 'leg': ['train', 'val'] if opt.display_val_acc else ['train']}
 
-    torch.save(net.cpu().state_dict(), os.path.join(opt.save_dir, 'init_net.pth'))
+    torch.save(decoder.cpu().state_dict(), os.path.join(opt.save_dir, 'init_net.pth'))
     if opt.use_gpu:
-        net.cuda()
+        decoder.cuda()
 
     # start training
     for epoch in range(opt.epoch_count, opt.num_epochs+opt.epoch_count):
         epoch_iter = 0
-        pred_train = []
-        target_train = []
 
         for i, data in enumerate(dataloader, 0):
-            img0, img1, label = data
+            img0, path0 = data
             if opt.use_gpu:
-                img0, img1, label = img0.cuda(), img1.cuda(), label.cuda()
+                img0 = img0.cuda()
             epoch_iter += 1
             total_iter += 1
 
             optimizer.zero_grad()
 
             # net forward
-            feat1, feat2, score = net(Variable(img0), Variable(img1))
+            recon = forward(img0, vgg, decoder)
 
             losses = {}
-            # classification loss
-            loss = criterion(score, label)
-            losses['classification'] = loss.item()
+            # Reconstruction loss
+            loss = criterionRec(recon, img0)
+            losses['Rec'] = loss.item()
 
-            # contrastive loss
-            if opt.lambda_contrastive > 0:
-                # new label: 0 similar (1), 1 dissimilar (0, 2)
-                idx = label == 1
-                label_new = label.clone()
-                label_new[idx] = 0
-                label_new[1-idx] = 1
-                this_loss = criterion_constrastive(
-                    feat1.view(img0.size(0), -1), feat2.view(img0.size(0), -1), label_new.float()
-                    ) * opt.lambda_contrastive
+            # feature matching
+            if opt.lambda_FM > 0.0:
+                feat_image = vgg.forward(img0)
+                feat_recon = vgg.forward(recon)
+                this_loss = criterionFM(feat_image, feat_recon) * opt.lambda_FM
                 loss += this_loss
-                losses['contrastive'] = this_loss.item()
-            
-            # # regularization
-            # if opt.lambda_regularization > 0:
-            #     reg1 = feat1.pow(2).mean()
-            #     reg2 = feat2.pow(2).mean()
-            #     this_loss = (reg1 + reg2) * opt.lambda_regularization
-            #     loss += this_loss
-            #     losses['regularization'] = this_loss.item()
-
-            # regularization of a
-            if opt.lambda_regularization > 0:
-                this_loss = score.pow(2).mean() * opt.lambda_regularization
-                loss += this_loss
-                losses['L2'] = this_loss.item()
-
-            # get predictions
-            pred_train.append(get_prediction(score, opt.draw_prob_thresh))
-            target_train.append(label.cpu().numpy())
+                losses['FM'] = this_loss.item()
 
             loss.backward()
             optimizer.step()
@@ -679,121 +649,40 @@ def train(opt, net, dataloader, dataloader_val=None):
                         win=opt.display_id
                     )
 
+                if opt.display_id >= 0:
+                    images = [tensor2image(img0.detach()), tensor2image(recon.detach())]
+                    vis.images(images, win=opt.display_id + 10)
+
+                    # save concatenated images
+                    images_pad = []
+                    for image in images:
+                        images_pad.append(image.transpose((1, 2, 0)))
+                    scipy.misc.imsave(os.path.join(opt.save_dir, 'images', 'ep%02d_it%06d.png' % (epoch, total_iter)),
+                                      np.concatenate(images_pad, axis=1))
+
+
                 loss_history.append(loss.item())
             
             if total_iter % opt.save_latest_freq == 0:
-                torch.save(net.cpu().state_dict(), os.path.join(opt.save_dir, 'latest_net.pth'))
+                torch.save(decoder.cpu().state_dict(), os.path.join(opt.save_dir, 'latest_net.pth'))
                 if opt.use_gpu:
-                    net.cuda()
+                    decoder.cuda()
                 if epoch % opt.save_epoch_freq == 0:
-                    torch.save(net.cpu().state_dict(), os.path.join(opt.save_dir, '{}_net.pth'.format(epoch)))
+                    torch.save(decoder.cpu().state_dict(), os.path.join(opt.save_dir, '{}_net.pth'.format(epoch)))
                     if opt.use_gpu:
-                        net.cuda()
-        
-        curr_acc = {}
-        # evaluate training
-        err_train = np.count_nonzero(np.concatenate(pred_train) - np.concatenate(target_train)) / dataset_size
-        curr_acc['train'] = 1 - err_train
+                        decoder.cuda()
 
-        # evaluate val
-        if opt.display_val_acc:
-            pred_val = []
-            target_val = []
-            for i, data in enumerate(dataloader_val, 0):
-                img0, img1, label = data
-                if opt.use_gpu:
-                    img0, img1 = img0.cuda(), img1.cuda()
-                _, _, output = net.forward(Variable(img0), Variable(img1))
-                pred_val.append(get_prediction(output, opt.draw_prob_thresh))
-                target_val.append(label.cpu().numpy())
-            err_val = np.count_nonzero(np.concatenate(pred_val) - np.concatenate(target_val)) / dataset_size_val
-            curr_acc['val'] = 1 - err_val
-
-        # plot accs
-        if opt.display_id >= 0:
-            plot_acc['X'].append(epoch)
-            plot_acc['Y'].append([curr_acc[k] for k in plot_acc['leg']])
-            vis.line(
-                X=np.stack([np.array(plot_acc['X'])] * len(plot_acc['leg']), 1),
-                Y=np.array(plot_acc['Y']),
-                opts={'title': 'accuracy', 'legend': plot_acc['leg'], 'xlabel': 'epoch', 'ylabel': 'accuracy'},
-                win=opt.display_id+1
-            )
-            sio.savemat(os.path.join(opt.save_dir, 'mat_loss'), plot_loss)
-            sio.savemat(os.path.join(opt.save_dir, 'mat_acc'), plot_acc)
-
-        torch.save(net.cpu().state_dict(), os.path.join(opt.save_dir, 'latest_net.pth'))
+        torch.save(decoder.cpu().state_dict(), os.path.join(opt.save_dir, 'latest_net.pth'))
         if opt.use_gpu:
-            net.cuda()
+            decoder.cuda()
         if epoch % opt.save_epoch_freq == 0:
-            torch.save(net.cpu().state_dict(), os.path.join(opt.save_dir, '{}_net.pth'.format(epoch)))
+            torch.save(decoder.cpu().state_dict(), os.path.join(opt.save_dir, '{}_net.pth'.format(epoch)))
             if opt.use_gpu:
-                net.cuda()
+                decoder.cuda()
 
     with open(os.path.join(opt.save_dir, 'loss.txt'), 'w') as f:
         for loss in loss_history:
             f.write(str(loss)+'\n')
-
-
-# Routines for testing
-def test(opt, net, dataloader):
-    dataset_size_val = opt.dataset_size_val
-    pred_val = []
-    target_val = []
-    for i, data in enumerate(dataloader, 0):
-        img0, img1, label = data
-        if opt.use_gpu:
-            img0, img1 = img0.cuda(), img1.cuda()
-        _, _, output = net.forward(img0, img1)
-
-        pred_val.append(get_prediction(output, opt.draw_prob_thresh).squeeze())
-        target_val.append(label.cpu().numpy().squeeze())
-        print('--> batch #%d' % (i+1))
-
-    err = np.count_nonzero(np.stack(pred_val) - np.stack(target_val)) / dataset_size_val
-    print('================================================================================')
-    print('accuracy: %.6f' % (100. * (1-err)))
-
-
-
-def heatmap(opt, net, dataloader):
-    import visdom
-    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
-
-    for i, data in enumerate(dataloader, 0):
-        img0, path0 = data
-        if opt.use_gpu:
-            img0 = img0.cuda()
-        hm = net.get_heat_map(img0)
-        hm = (hm-hm.min())/(hm.max()-hm.min())*255
-        hm = torch.nn.functional.interpolate(input=hm, size=(224, 224), mode='bilinear', align_corners=True)
-        hm = hm.detach().cpu().numpy()
-        hm = np.tile(hm[0, 0, ...].reshape((224, 224, 1)), (1, 1, 3))
-
-        images = []
-        images += [tensor2image(img0.detach())]
-        images += [hm.transpose((2, 0, 1))]
-        vis.images(images, win=opt.display_id + 10)
-
-
-def heatmap_fc(opt, net, dataloader):
-    import visdom
-    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
-
-    for i, data in enumerate(dataloader, 0):
-        img0, path0 = data
-        if opt.use_gpu:
-            img0 = img0.cuda()
-        hm = net.get_heat_map_fc(img0)
-        hm = (hm-hm.min())/(hm.max()-hm.min())*255
-        hm = torch.nn.functional.interpolate(input=hm, size=(224, 224), mode='bilinear', align_corners=True)
-        hm = hm.detach().cpu().numpy()
-        hm = np.tile(hm[0, 0, ...].reshape((224, 224, 1)), (1, 1, 3))
-
-        images = []
-        images += [tensor2image(img0.detach())]
-        images += [hm.transpose((2, 0, 1))]
-        vis.images(images, win=opt.display_id + 10)
 
 
 def F_decode(opt, net, decoder, dataloader):
@@ -821,237 +710,9 @@ def F_decode(opt, net, decoder, dataloader):
         # save_image(images[1], 'results/image_%d_B.png' % i)
 
 
-def F_inverse(opt, net, dataloader):
-    import visdom
-    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
-
-    # netIP = networks.AlexNetFeature(input_nc=3, pooling='None')
-    # netIP.cuda()
-    # if isinstance(netIP, torch.nn.DataParallel):
-    #     netIP.module.load_pretrained(opt.pretrained_model_path_IP)
-    # else:
-    #     netIP.load_pretrained(opt.pretrained_model_path_IP)
-
-    delta = -0.1
-
-    for i, data in enumerate(dataloader, 0):
-        img0, path0 = data
-        if opt.use_gpu:
-            img0 = img0.cuda()
-        emb0 = net.get_feature(img0)
-        W1, W2, W3 = net.get_delta(emb0)
-        emb1 = [emb0[0]+W1*delta, emb0[1]+W2*delta*1, emb0[2]+W3*delta*1]
-
-        img1 = optimize_image(img0, emb1, net, None, opt)
-
-        images = []
-        images += [tensor2image(img0.detach())]
-        images += [tensor2image(img1.detach())]
-        vis.images(images, win=opt.display_id + 10)
-
-        # hack
-        save_image(images[0], 'results/image_%d_A.png' % i)
-        save_image(images[1], 'results/image_%d_B.png' % i)
-
-
-def optimize_image(initial_image, F, net, netIP, opt, n_iter=500, lr=0.1):
-    tv_lambda = 10
-
-    x = initial_image.clone()
-    # x.zero_()
-
-    recon_var = nn.Parameter(x, requires_grad=True)
-
-    # Get size of features
-    # orig_feature_vars = net.forward_once(recon_var)
-    # sizes = ([f.data[:1].size() for f in orig_feature_vars])
-    # cat_offsets = torch.cat(
-    #     [torch.Tensor([0]), torch.cumsum(torch.Tensor([f.data[:1].nelement() for f in orig_feature_vars]), 0)])
-
-    # Reshape provided features to match original features
-    # cat_features = F.view(-1)
-    # features = tuple(Variable(cat_features[int(start_i):int(end_i)].view(size)).cuda()
-    #                  for size, start_i, end_i in zip(sizes, cat_offsets[:-1], cat_offsets[1:]))
-    features = [f.clone() for f in F]
-
-    # Create optimizer and loss functions
-    optimizer = optim.LBFGS(
-        params=[recon_var],
-        max_iter=n_iter,
-    )
-    optimizer.n_steps = 0
-    criterion3 = nn.MSELoss(size_average=False).cuda()
-    criterion4 = nn.MSELoss(size_average=False).cuda()
-    criterion5 = nn.MSELoss(size_average=False).cuda()
-    criterion_tv = TVLoss().cuda()
-
-    # Optimize
-    def step():
-        net.zero_grad()
-        if recon_var.grad is not None:
-            recon_var.grad.data.fill_(0)
-        # OR #
-        # optimizer.zero_grad()
-
-        output_var = net.get_feature(recon_var)
-        loss3 = criterion3(output_var[0], features[0])
-        loss4 = criterion4(output_var[1], features[1])
-        loss5 = criterion5(output_var[2], features[2])
-        loss_tv = tv_lambda * criterion_tv(recon_var)
-        loss = loss3*1 + loss4*1 + loss5*1 + loss_tv
-        loss.backward()
-
-        if optimizer.n_steps % 25 == 0:
-            print('Step: %d  total: %.1f  conv3: %.1f  conv4: %.1f  conv5: %.1f  tv: %.3f' %
-                  (optimizer.n_steps, loss.item(), loss3.item(), loss4.item(), loss5.item(), loss_tv.item()))
-
-        optimizer.n_steps += 1
-        return loss
-
-    optimizer.step(step)
-    recon = recon_var
-
-    return recon # + initial_image
-
-
-
-
-
-    # img_orig = img
-    # img = img_orig.clone()
-    # img.requires_grad = True
-    # optim_input = optim.LBFGS([img], lr=lr)
-    # emb = emb.view(1, 1, 1, 1)
-    # # tv_loss = TVLoss()
-    #
-    # def closure():
-    #     optim_input.zero_grad()
-    #     img_emb = net.forward(img)
-    #
-    #     loss = 0.5 * torch.nn.MSELoss()(img_emb, emb) + total_variation_loss(img) * 0.1
-    #     loss.backward()
-    #     return loss
-    #
-    # for _ in tqdm(range(100)):
-    #     optim_input.step(closure)
-    #
-    # return img
-
-
-
-
-
-
-
-
-# Routines for extracting embedding
-def embedding(opt, net, dataloader):
-    features = []
-    labels = []
-    for _, data in enumerate(dataloader, 0):
-        img0, path0 = data
-        if opt.use_gpu:
-            img0 = img0.cuda()
-        feature = net.get_inner_prod(img0)
-        feature = feature.cpu().detach().numpy()
-        features.append(feature.reshape([1, 1]))
-        labels.append(get_attr_value(path0[0]))
-        print('--> %s' % path0[0])
-
-    X = np.concatenate(features, axis=0)
-    labels = np.array(labels)
-    np.save(os.path.join(opt.checkpoint_dir, opt.name, 'features_%s.npy' % opt.which_epoch), X)
-    np.save(os.path.join(opt.checkpoint_dir, opt.name, 'labels_%s.npy' % opt.which_epoch), labels)
-
-
 # Routines for visualization
 def save_image(npy, path):
     scipy.misc.imsave(path, npy.transpose((1,2,0)))
-
-
-def attention(opt, net, dataloader):
-    import visdom
-    vis = visdom.Visdom(server='http://localhost', port=opt.display_port)
-
-    update_relus(net)
-
-    for i, data in enumerate(dataloader, 0):
-        img0, img1, label = data
-        if opt.use_gpu:
-            img0, img1 = img0.cuda(), img1.cuda()
-        att0, att1 = get_attention(img0, img1, label, net, opt)
-        # att0, att1 = att0.abs(), att1.abs()
-        alpha = 0.01
-        images = []
-        image = tensor2image(img0.detach())
-        image_ = image
-        images += [image]
-        image = feature2image(att0.detach())
-        image = image * (1-alpha) + image_ * alpha
-        images += [image]
-        image = tensor2image(img1.detach())
-        image_ = image
-        images += [image]
-        image = feature2image(att1.detach())
-        image = image * (1 - alpha) + image_ * alpha
-        images += [image]
-        vis.images(images, win=opt.display_id + 10)
-
-        # hack
-        save_image(images[0], 'samples_vis/attention/iter%d_A_x.png' % i)
-        save_image(images[1], 'samples_vis/attention/iter%d_A_a.png' % i)
-        save_image(images[2], 'samples_vis/attention/iter%d_B_x.png' % i)
-        save_image(images[3], 'samples_vis/attention/iter%d_B_a.png' % i)
-        print('--> iter#%d' % i)
-        # time.sleep(1)
-
-
-def get_attention(img0, img1, label, net, opt):
-    """
-        backprop / deconv
-    """
-    img0.requires_grad = True
-    img1.requires_grad = True
-    feat1, feat2, score = net(img0, img1)
-    net.zero_grad()
-    # prob = torch.nn.functional.sigmoid(score)
-    grad_tensor = torch.FloatTensor([1]).view(1, 1, 1, 1).cuda()
-    torch.autograd.backward(score, grad_tensor)
-    return img0.grad, img1.grad
-
-
-# def get_attention(img0, img1, label, net, opt):
-#     """
-#         backprop
-#     """
-#     img0.requires_grad = True
-#     img1.requires_grad = True
-#     feat1, feat2, score, _, _ = net(img0, img1)
-#     loss = networks.BinaryCrossEntropyLoss()(score, label.cuda())
-#     loss.backward()
-#     return img0.grad, img1.grad
-
-
-def update_relus(net):
-    """
-        Updates relu activation functions so that it only returns positive gradients
-    """
-    from torch.nn import ReLU
-
-    def relu_hook_function(module, grad_in, grad_out):
-        """
-        If there is a negative gradient, changes it to zero
-        """
-        if isinstance(module, ReLU):
-            return (torch.clamp(grad_in[0], min=0.0),)
-
-    def set_relu_hook(m):
-        classname = m.__class__.__name__
-        # print(classname)
-        if classname.find('ReLU') != -1:
-            m.register_backward_hook(relu_hook_function)
-
-    net.apply(set_relu_hook)
 
 
 ###############################################################################
@@ -1063,16 +724,17 @@ if __name__=='__main__':
     opt = Options().get_options()
 
     # get model
-    net = get_model(opt)
+    vgg = get_vgg(opt)
+    decoder = get_decoder(opt)
 
     if opt.mode == 'train':
         # get dataloader
-        dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, get_transform(opt))
+        dataset = SingleImageDataset(opt.dataroot, opt.datafile, get_transform(opt))
         dataloader = DataLoader(dataset, shuffle=not opt.serial_batches, num_workers=opt.num_workers, batch_size=opt.batch_size)
         opt.dataset_size = len(dataset)
         # val dataset
         if opt.dataroot_val:
-            dataset_val = SiameseNetworkDataset(opt.dataroot_val, opt.datafile_val, get_transform(opt))
+            dataset_val = SingleImageDataset(opt.dataroot_val, opt.datafile_val, get_transform(opt))
             dataloader_val = DataLoader(dataset_val, shuffle=False, num_workers=0, batch_size=1)
             opt.dataset_size_val = len(dataset_val)
         else:
@@ -1080,46 +742,6 @@ if __name__=='__main__':
             opt.dataset_size_val = 0
         print('dataset size = %d' % len(dataset))
         # train
-        train(opt, net, dataloader, dataloader_val)
-    elif opt.mode == 'test':
-        # get dataloader
-        dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=opt.num_workers, batch_size=opt.batch_size)
-        opt.dataset_size_val = len(dataset)
-        # test
-        test(opt, net, dataloader)
-    elif opt.mode == 'embedding':
-        # get dataloader
-        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        # get embedding
-        embedding(opt, net, dataloader)
-    elif opt.mode == 'decode':
-        # get dataloader
-        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        decoder = get_decoder(opt)
-        F_decode(opt, net, decoder, dataloader)
-    elif opt.mode == 'inverse':
-        # get dataloader
-        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        F_inverse(opt, net, dataloader)
-    elif opt.mode == 'heatmap':
-        # get dataloader
-        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        heatmap(opt, net, dataloader)
-    elif opt.mode == 'heatmap_fc':
-        # get dataloader
-        dataset = SingleImageDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        heatmap_fc(opt, net, dataloader)
-    elif opt.mode == 'attention':
-        # get dataloader
-        dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
-        dataloader = DataLoader(dataset, shuffle=False, num_workers=0, batch_size=1)
-        # get embedding
-        attention(opt, net, dataloader)
+        train(opt, vgg, decoder, dataloader, dataloader_val)
     else:
         raise NotImplementedError('Mode [%s] is not implemented.' % opt.mode)

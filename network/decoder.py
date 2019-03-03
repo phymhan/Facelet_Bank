@@ -25,9 +25,9 @@ class vgg_decoder(base_network.BaseModel, nn.Module):
         self.model = base_network.Vgg_recon()
 
     def forward(self, fy, img=None):
-        fy = [util.toVariable(f) for f in fy]
+        # fy = [util.toVariable(f) for f in fy]
         y = self.model.forward(fy)
-        y = y + img
+        # y = y + img
         return y
 
     def load(self, pretrain_path, epoch_label='latest'):
