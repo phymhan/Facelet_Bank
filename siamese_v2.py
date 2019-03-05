@@ -42,6 +42,7 @@ class Options():
         parser.add_argument('--datafile_val', type=str, default='')
         parser.add_argument('--pretrained_model_path', type=str, default='pretrained_models/resnet18-5c106cde.pth', help='path to pretrained models')
         parser.add_argument('--pretrained_model_path_IP', type=str, default='pretrained_models/alexnet-owt-4df8aa71.pth', help='pretrained model path to IP net')
+        parser.add_argument('--pretrained_model_path_decoder', type=str, default='', help='pretrained model path to decoder')
         parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
         parser.add_argument('--save_epoch_freq', type=int, default=5, help='frequency of saving checkpoints')
         parser.add_argument('--num_workers', type=int, default=4, help='number of workers for data loader')
@@ -68,7 +69,6 @@ class Options():
         parser.add_argument('--cnn_relu_slope', type=float, default=0.7)
         parser.add_argument('--no_cxn', action='store_true', help='if true, do **not** add batchNorm and ReLU between cnn and fc')
         parser.add_argument('--lambda_regularization', type=float, default=0.0, help='weight for feature regularization loss')
-        parser.add_argument('--lambda_contrastive', type=float, default=0.0, help='weight for contrastive loss')
         parser.add_argument('--print_freq', type=int, default=10, help='print loss every print_freq iterations')
         parser.add_argument('--display_id', type=int, default=1, help='visdom window id, to disable visdom set id = -1.')
         parser.add_argument('--display_port', type=int, default=8097)
@@ -125,13 +125,13 @@ class Options():
 # Dataset and Dataloader
 ###############################################################################
 class SiameseNetworkDataset(Dataset):
-    def __init__(self, rootdir, source_file, transform=None, warp=True):
+    def __init__(self, rootdir, source_file, transform=None, warp=True, precompute=True):
         self.rootdir = rootdir
         self.landmarkdir = rootdir.rstrip('/').rstrip('\\') + '_landmark'
         self.source_file = source_file
         self.transform = transform
         self.warp = warp
-        self.precompute_landmark = os.path.exists(self.landmarkdir)
+        self.precompute_landmark = os.path.exists(self.landmarkdir) and precompute
         with open(self.source_file, 'r') as f:
             self.source_file = f.readlines()
         if self.warp:
@@ -281,6 +281,11 @@ def _scale(feat):
         numel += f.size(1)
     return [f/numel for f in feat]
 
+def _descale(feat):
+    numel = 0.0
+    for f in feat:
+        numel += f.size(1)
+    return [f*numel for f in feat]
 
 def _normalize(feat, norm):
     if norm == 'group':
@@ -322,7 +327,7 @@ class SiameseNetwork(nn.Module):
     def _process_feature(self, feat, scale=True, norm='group'):
         if scale:
             feat = _scale(feat)
-        feat = _normalize(feat, norm)
+        # feat = _normalize(feat, norm)
         return feat
 
     def get_feature(self, x):
@@ -523,10 +528,11 @@ def get_model(opt):
 
 
 def get_decoder(opt):
-    decoder = vgg_decoder()
+    decoder = vgg_decoder(False)
+    if opt.pretrained_model_path_decoder:
+        decoder.load_state_dict(torch.load(opt.pretrained_model_path_decoder), strict=True)
     if opt.use_gpu:
         decoder.cuda()
-
     return decoder
 
 
@@ -572,13 +578,21 @@ def get_transform(opt):
     return transforms.Compose(transform_list)
 
 
+def forward(feat, delta, decoder, a):
+    feat = _scale(feat)
+    delta = _scale(delta)
+    feat_ = [f+a*w for f, w in zip(feat, delta)]
+    feat_ = _descale(feat_)
+    return decoder.forward(feat_)
+
+
 # Routines for training
-def train(opt, net, dataloader, dataloader_val=None):
-    if opt.lambda_contrastive > 0:
-        criterion_constrastive = networks.ContrastiveLoss()
+def train(opt, net, decoder, dataloader, dataloader_val=None):
     opt.save_dir = os.path.join(opt.checkpoint_dir, opt.name)
     if not os.path.exists(opt.save_dir):
         os.makedirs(opt.save_dir)
+    if opt.display_id >= 0 and not os.path.exists(os.path.join(opt.save_dir, 'images')):
+        os.makedirs(os.path.join(opt.save_dir, 'images'))
     
     # criterion
     criterion = networks.BinaryCrossEntropyLoss()
@@ -596,8 +610,6 @@ def train(opt, net, dataloader, dataloader_val=None):
     num_iter_per_epoch = math.ceil(dataset_size / opt.batch_size)
     opt.display_val_acc = not not dataloader_val
     loss_legend = ['classification']
-    if opt.lambda_contrastive > 0:
-        loss_legend.append('contrastive')
     if opt.lambda_regularization > 0:
         loss_legend.append('L2')
     if opt.display_id >= 0:
@@ -626,33 +638,12 @@ def train(opt, net, dataloader, dataloader_val=None):
             optimizer.zero_grad()
 
             # net forward
-            feat1, feat2, score = net(Variable(img0), Variable(img1))
+            feat1, feat2, score = net(img0, img1)
 
             losses = {}
             # classification loss
             loss = criterion(score, label)
             losses['classification'] = loss.item()
-
-            # contrastive loss
-            if opt.lambda_contrastive > 0:
-                # new label: 0 similar (1), 1 dissimilar (0, 2)
-                idx = label == 1
-                label_new = label.clone()
-                label_new[idx] = 0
-                label_new[1-idx] = 1
-                this_loss = criterion_constrastive(
-                    feat1.view(img0.size(0), -1), feat2.view(img0.size(0), -1), label_new.float()
-                    ) * opt.lambda_contrastive
-                loss += this_loss
-                losses['contrastive'] = this_loss.item()
-            
-            # # regularization
-            # if opt.lambda_regularization > 0:
-            #     reg1 = feat1.pow(2).mean()
-            #     reg2 = feat2.pow(2).mean()
-            #     this_loss = (reg1 + reg2) * opt.lambda_regularization
-            #     loss += this_loss
-            #     losses['regularization'] = this_loss.item()
 
             # regularization of a
             if opt.lambda_regularization > 0:
@@ -678,6 +669,25 @@ def train(opt, net, dataloader, dataloader_val=None):
                         opts={'title': 'loss', 'legend': plot_loss['leg'], 'xlabel': 'epoch', 'ylabel': 'loss'},
                         win=opt.display_id
                     )
+
+                if opt.display_id >= 0:
+                    # realA, fakeA, realB
+                    realA = img0[0:1, ...]
+                    realB = img1[0:1, ...]
+                    featA = [f[0:1, ...] for f in feat1]
+                    deltaA = net.get_delta(featA)
+                    a = score[0:1, ...]
+                    fakeA = forward(featA, deltaA, decoder, a)
+                    print(realB.size())
+                    images = [tensor2image(realA.detach()), tensor2image(fakeA.detach()), tensor2image(realB.detach())]
+                    vis.images(images, win=opt.display_id + 10)
+
+                    # save concatenated images
+                    images_pad = []
+                    for image in images:
+                        images_pad.append(image.transpose((1, 2, 0)))
+                    scipy.misc.imsave(os.path.join(opt.save_dir, 'images', 'ep%02d_it%06d.png' % (epoch, total_iter)),
+                                      np.concatenate(images_pad, axis=1))
 
                 loss_history.append(loss.item())
             
@@ -1064,10 +1074,11 @@ if __name__=='__main__':
 
     # get model
     net = get_model(opt)
+    decoder = get_decoder(opt)
 
     if opt.mode == 'train':
         # get dataloader
-        dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, get_transform(opt))
+        dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, get_transform(opt), precompute=False, warp=False)
         dataloader = DataLoader(dataset, shuffle=not opt.serial_batches, num_workers=opt.num_workers, batch_size=opt.batch_size)
         opt.dataset_size = len(dataset)
         # val dataset
@@ -1080,7 +1091,7 @@ if __name__=='__main__':
             opt.dataset_size_val = 0
         print('dataset size = %d' % len(dataset))
         # train
-        train(opt, net, dataloader, dataloader_val)
+        train(opt, net, decoder, dataloader, dataloader_val)
     elif opt.mode == 'test':
         # get dataloader
         dataset = SiameseNetworkDataset(opt.dataroot, opt.datafile, transform=get_transform(opt))
